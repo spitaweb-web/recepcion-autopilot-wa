@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Recepción Autopilot — Clínica Ortega</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <main>
+    <div class="container">
+      <div class="badges">
+        <span class="badge">Recepción Autopilot</span>
+        <span class="badge">Clínica Ortega</span>
+        <span class="badge">WhatsApp + web</span>
+        <span class="badge">Seña (demo)</span>
+        <span class="badge">Sin npm</span>
+      </div>
+
+      <div class="grid grid-2">
+        <section class="card sectionPad">
+          <h1 class="h1">Recepción que atiende<br/>cuando vos no podés.</h1>
+          <p class="p">
+            Esto es una demo con UX premium mínima y flujos reales: reservar → seña → confirmado.
+            Está pensada para atacar el dolor #1: <b>saturación de WhatsApp</b>.
+          </p>
+
+          <div class="kpiGrid">
+            <div class="card2 kpi">
+              <div class="kpiTitle">⚡ Anti-saturación</div>
+              <p class="kpiDesc">Saca del medio el ida-y-vuelta repetitivo: turnos, cambios, cancelación y datos.</p>
+            </div>
+            <div class="card2 kpi">
+              <div class="kpiTitle">🧠 Guardrails</div>
+              <p class="kpiDesc">Flujos con reglas. Handoff con contexto cuando el caso lo pide.</p>
+            </div>
+            <div class="card2 kpi">
+              <div class="kpiTitle">💳 Seña por cobertura</div>
+              <p class="kpiDesc">Obra social: $5.000 reintegrable. Particular: $10.000 para confirmar.</p>
+            </div>
+            <div class="card2 kpi">
+              <div class="kpiTitle">🔌 Enchufable</div>
+              <p class="kpiDesc">Endpoints listos para WhatsApp Cloud API y Mercado Pago cuando esté el número.</p>
+            </div>
+          </div>
+
+          <div class="card2 demoBox" style="margin-top:14px;">
+            <div style="font-size:14px;font-weight:600;">Demo “piña” (60 segundos)</div>
+            <ol class="ol">
+              <li>Escribí: <span class="mono">hola</span></li>
+              <li><span class="mono">1</span> (Reservar) → <span class="mono">1</span> (EcoDoppler)</li>
+              <li><span class="mono">2</span> (Luján) → <span class="mono">2</span> (Particular)</li>
+              <li><span class="mono">A</span> (Horario) → aparece link</li>
+              <li>Click “Marcar pago” → turno confirmado ✅</li>
+            </ol>
+          </div>
+
+          <div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:16px;">
+            <a class="btn" href="/admin">Ver panel /admin</a>
+            <a class="btn btnGold" href="#demo">Probar demo ahora</a>
+          </div>
+
+          <div class="hr"></div>
+          <div class="small">
+            Tip comercial: vendelo como “Recepción Autopilot” (no chatbot). Si no baja saturación, es decoración.
+          </div>
+        </section>
+
+        <section id="demo" class="sticky">
+          <div class="card">
+            <div class="chatHeader">
+              <div class="row">
+                <div class="iconBox">💬</div>
+                <div>
+                  <div class="chatTitle">Recepción Autopilot <span class="badge" style="padding:2px 10px;margin-left:8px;font-size:11px;">Clínica Ortega</span></div>
+                  <div class="chatSub">Demo local. Mismos endpoints para enchufar WhatsApp real.</div>
+                </div>
+              </div>
+              <a href="/admin" class="btn" style="font-size:12px;padding:10px 12px;">Panel ↗</a>
+            </div>
+
+            <div class="sectionPad" style="border-bottom:1px solid var(--line);">
+              <div class="row" style="gap:10px;">
+                <div class="row" style="gap:8px;color:var(--muted);font-size:12px;">
+                  📱 <span>Paciente</span>
+                </div>
+                <input id="phone" class="input" value="5492619998888" placeholder="Ej: 549261..." />
+              </div>
+
+              <div class="quickRow" style="margin-top:10px;">
+                <button class="quick" data-q="hola">hola</button>
+                <button class="quick" data-q="1">1</button>
+                <button class="quick" data-q="2">2</button>
+                <button class="quick" data-q="3">3</button>
+                <button class="quick" data-q="4">4</button>
+              </div>
+            </div>
+
+            <div id="chat" class="chatBody"></div>
+
+            <div class="chatFooter">
+              <div id="detect" class="card2 detect" style="display:none;">
+                <div class="notice">
+                  Detecté un turno. <span style="color:rgba(230,237,243,.9);font-weight:600;">appointmentId:</span>
+                  <span id="apptShort" class="mono" style="color:rgba(230,237,243,.9)"></span>
+                </div>
+                <button id="payBtn" class="btn btnGold" style="font-size:12px;padding:10px 12px;">Marcar pago ✅</button>
+              </div>
+
+              <div class="footerRow">
+                <input id="input" class="input" placeholder='Escribí "hola" o 1–4…' />
+                <button id="send" class="btn">Enviar ↗</button>
+              </div>
+
+              <div class="notice">
+                WhatsApp: <span class="mono">/api/whatsapp</span> · Mercado Pago: <span class="mono">/api/mp/webhook</span>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

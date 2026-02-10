@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Panel — Clínica Ortega</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <main>
+    <div class="container">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;">
+        <div>
+          <h1 style="font-size:24px;margin:0;font-weight:700;">Panel — Clínica Ortega</h1>
+          <p style="margin:8px 0 0;color:var(--muted);font-size:14px;">Demo sin auth (después lo blindamos)</p>
+          <div class="badges" style="margin-top:10px;">
+            <span class="badge">Turnos</span>
+            <span class="badge">Handoffs</span>
+            <span class="badge">Seña obra $5k / part $10k</span>
+            <span class="badge">Sin npm</span>
+          </div>
+        </div>
+        <a href="/" class="btn">Volver</a>
+      </div>
+
+      <section class="card" style="margin-top:20px;overflow:hidden;">
+        <div style="padding:14px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;">
+          <div style="font-weight:600;">Turnos</div>
+          <div id="countA" style="font-size:12px;color:var(--muted);">—</div>
+        </div>
+        <div class="tableWrap">
+          <table>
+            <thead>
+              <tr>
+                <th>created_at</th><th>id</th><th>paciente</th><th>servicio</th><th>sede</th><th>cobertura</th><th>seña</th><th>fecha</th><th>estado</th><th>pago</th>
+              </tr>
+            </thead>
+            <tbody id="rowsA"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card" style="margin-top:20px;overflow:hidden;">
+        <div style="padding:14px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;">
+          <div style="font-weight:600;">Handoffs a recepción</div>
+          <div id="countH" style="font-size:12px;color:var(--muted);">—</div>
+        </div>
+        <div class="tableWrap">
+          <table style="min-width:980px;">
+            <thead>
+              <tr>
+                <th>created_at</th><th>id</th><th>paciente</th><th>motivo</th><th>status</th>
+              </tr>
+            </thead>
+            <tbody id="rowsH"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </main>
+  <script src="/admin.js"></script>
+</body>
+</html>
