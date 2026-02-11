@@ -1,297 +1,438 @@
-/**
- * Recepción Autopilot — Zero-deps production pack (CommonJS)
- * - Static web demo (/) + admin (/admin)
- * - WhatsApp Cloud API webhook: /api/whatsapp (GET verify, POST messages)
- * - Minimal in-memory store (for demo)
- *
- * No external dependencies. Node 18+ recommended (Node 20 OK).
- */
-
 const http = require("http");
+const https = require("https");
 const fs = require("fs");
 const path = require("path");
-const { URL } = require("url");
+const crypto = require("crypto");
+const url = require("url");
 
-// ------------------ Config ------------------
-const PORT = parseInt(process.env.PORT || "3000", 10);
-const CLINIC_NAME = process.env.CLINIC_NAME || "Clínica Ortega";
+const PORT = process.env.PORT || 3000;
 
-// WhatsApp Cloud API (Meta)
-const WA_VERIFY_TOKEN = process.env.WA_VERIFY_TOKEN || "spita_verify_123";
+// ====== ENV (WhatsApp Cloud API) ======
+const WA_VERIFY_TOKEN = process.env.WA_VERIFY_TOKEN || "change_me_verify_token";
 const WA_ACCESS_TOKEN = process.env.WA_ACCESS_TOKEN || "";
-const WA_PHONE_NUMBER_ID = process.env.WA_PHONE_NUMBER_ID || "";
-const WA_GRAPH_VERSION = process.env.WA_GRAPH_VERSION || "v19.0"; // stable
 
-// ------------------ In-memory store (demo) ------------------
-const store = {
-  messages: [], // {ts, from, text, channel}
-  appointments: [], // {id, name, phone, service, date, slot, payerType, deposit, status, createdAt}
-  handoffs: [], // {id, phone, reason, context, createdAt, status}
+// ACEPTA AMBOS NOMBRES (por tu captura de Render)
+const WA_PHONE_NUMBER_ID =
+  process.env.WA_PHONE_NUMBER_ID ||
+  process.env.WA_PHONE_NUMBER_ID || // (tu key actual en Render)
+  "";
+
+// ====== Config Clínica Ortega (demo) ======
+const CLINIC = {
+  id: "clinic-ortega",
+  name: "Clínica Ortega",
+  timezone: "America/Argentina/Mendoza",
+  deposit_obrasocial: 5000,
+  deposit_other: 10000,
 };
 
-function nowISO() {
-  return new Date().toISOString();
-}
+// ====== In-memory store ======
+const store = {
+  conversations: new Map(),
+  appointments: [],
+  handoffs: [],
+};
 
-function json(res, statusCode, obj) {
-  const body = JSON.stringify(obj);
-  res.writeHead(statusCode, {
-    "content-type": "application/json; charset=utf-8",
-    "cache-control": "no-store",
-  });
+function nowISO() { return new Date().toISOString(); }
+function uid() { return crypto.randomUUID(); }
+
+function json(res, status, data) {
+  const body = JSON.stringify(data);
+  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   res.end(body);
 }
 
-function text(res, statusCode, body) {
-  res.writeHead(statusCode, {
-    "content-type": "text/plain; charset=utf-8",
-    "cache-control": "no-store",
-  });
-  res.end(body);
+function text(res, status, data, contentType = "text/plain; charset=utf-8") {
+  res.writeHead(status, { "Content-Type": contentType });
+  res.end(data);
 }
 
-function badRequest(res, msg) {
-  json(res, 400, { ok: false, error: msg || "bad_request" });
-}
-
-function notFound(res) {
-  json(res, 404, { ok: false, error: "not_found" });
-}
-
-function readBody(req, limitBytes = 1_000_000) {
+function readBody(req) {
   return new Promise((resolve, reject) => {
-    let size = 0;
-    const chunks = [];
-    req.on("data", (c) => {
-      size += c.length;
-      if (size > limitBytes) {
-        reject(new Error("payload_too_large"));
-        req.destroy();
-        return;
-      }
-      chunks.push(c);
-    });
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    let raw = "";
+    req.on("data", (c) => raw += c);
+    req.on("end", () => resolve(raw));
     req.on("error", reject);
   });
 }
 
-function safeJsonParse(s) {
-  try { return JSON.parse(s); } catch { return null; }
+function safeJsonParse(s) { try { return JSON.parse(s); } catch { return null; } }
+
+function detectIntent(message) {
+  const m = (message || "").toLowerCase().trim();
+  if (!m) return "unknown";
+  if (m.includes("reprogram") || m.includes("cambiar") || m.includes("mover")) return "reschedule";
+  if (m.includes("cancel") || m.includes("anular")) return "cancel";
+  if (m.includes("humano") || m.includes("recepción") || m.includes("recepcion") || m.includes("persona")) return "human";
+  if (m.includes("turno") || m.includes("reserv") || m.includes("sacar")) return "reserve";
+  if (m === "1") return "reserve";
+  if (m === "2") return "reschedule";
+  if (m === "3") return "cancel";
+  if (m === "4") return "human";
+  return "unknown";
 }
 
-function serveStatic(req, res) {
-  const u = new URL(req.url, `http://localhost:${PORT}`);
-  let pathname = u.pathname;
+function menu() {
+  return [
+    "Hola 👋 Soy la recepción automática de Clínica Ortega.",
+    "¿Qué necesitás?",
+    "1) Reservar turno",
+    "2) Reprogramar",
+    "3) Cancelar",
+    "4) Hablar con recepción",
+  ].join("\n");
+}
 
-  if (pathname === "/") pathname = "/index.html";
-  const filePath = path.join(__dirname, "public", pathname.replace(/^\/+/, ""));
-  const publicRoot = path.join(__dirname, "public");
+function getMockSlots() {
+  const now = Date.now();
+  const h = 60 * 60 * 1000;
+  return [
+    { label: "A) Hoy 18:00", iso: new Date(now + 2 * h).toISOString() },
+    { label: "B) Mañana 09:00", iso: new Date(now + 15 * h).toISOString() },
+    { label: "C) Mañana 18:30", iso: new Date(now + 24 * h + 30 * 60 * 1000).toISOString() },
+  ];
+}
 
-  // Prevent path traversal
-  if (!filePath.startsWith(publicRoot)) {
-    return notFound(res);
-  }
+function getOrCreateConversation(clinicId, phone) {
+  const key = `${clinicId}:${phone}`;
+  const existing = store.conversations.get(key);
+  if (existing) return { key, convo: existing };
+  const convo = { id: uid(), clinic_id: clinicId, user_phone: phone, state: {}, last_intent: null, updated_at: nowISO(), created_at: nowISO() };
+  store.conversations.set(key, convo);
+  return { key, convo };
+}
 
-  if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
-    return notFound(res);
-  }
+function updateConversation(key, patch) {
+  const convo = store.conversations.get(key);
+  if (!convo) return;
+  store.conversations.set(key, { ...convo, ...patch, updated_at: nowISO() });
+}
 
-  const ext = path.extname(filePath).toLowerCase();
-  const types = {
-    ".html": "text/html; charset=utf-8",
-    ".css": "text/css; charset=utf-8",
-    ".js": "application/javascript; charset=utf-8",
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".svg": "image/svg+xml",
-    ".ico": "image/x-icon",
+function createHeldAppointment({ phone, service, location, coverage, deposit_amount, start_at }) {
+  const appt = {
+    id: uid(),
+    clinic_id: CLINIC.id,
+    user_phone: phone,
+    service,
+    location,
+    coverage,
+    deposit_amount,
+    start_at,
+    status: "held",
+    payment_status: "unpaid",
+    payment_ref: null,
+    created_at: nowISO(),
   };
-  const ctype = types[ext] || "application/octet-stream";
-
-  res.writeHead(200, { "content-type": ctype, "cache-control": "no-cache" });
-  fs.createReadStream(filePath).pipe(res);
+  store.appointments.unshift(appt);
+  return appt;
 }
 
-function pickTextFromWAMessage(msg) {
-  // https://developers.facebook.com/docs/whatsapp/cloud-api/webhooks/components/
-  if (!msg) return "";
-  if (msg.type === "text" && msg.text && msg.text.body) return msg.text.body;
-  // future: interactive, button, etc.
-  return "";
+function markAppointmentPaid(appointmentId, paymentRef) {
+  const idx = store.appointments.findIndex(a => a.id === appointmentId);
+  if (idx < 0) return false;
+  store.appointments[idx] = { ...store.appointments[idx], payment_status: "paid", status: "confirmed", payment_ref: paymentRef || "demo-pay" };
+  return true;
 }
 
-function buildAutoReply(userText) {
-  const t = (userText || "").trim().toLowerCase();
-
-  // Concierge-minimal demo replies
-  if (!t) return `Hola 👋 Soy la recepción de ${CLINIC_NAME}. ¿Qué necesitás: reservar, reprogramar o cancelar?`;
-
-  if (t.includes("hola") || t.includes("buenas") || t.includes("buen")) {
-    return `Hola 👋 Soy la recepción de ${CLINIC_NAME}. ¿Querés reservar turno? (respondé: reservar)`;
-  }
-  if (t.includes("reservar")) {
-    return `Perfecto. ¿Qué estudio? (EcoDoppler / Holter / ECG / Consulta)`;
-  }
-  if (t.includes("ecodoppler") || t.includes("eco")) {
-    return `EcoDoppler ✅ ¿Obra social o particular?`;
-  }
-  if (t.includes("obra")) {
-    return `Obra social ✅ Seña reintegrable $5.000. ¿Te va bien esta semana? (sí/no)`;
-  }
-  if (t.includes("particular")) {
-    return `Particular ✅ Seña $10.000. ¿Te va bien esta semana? (sí/no)`;
-  }
-  if (t === "si" || t === "sí") {
-    return `Genial. Te paso el link de seña (demo) y al pagar queda confirmado.`;
-  }
-  if (t.includes("cancel")) {
-    return `Ok. Decime tu DNI o nombre completo y te lo cancelo (demo).`;
-  }
-  if (t.includes("reprog")) {
-    return `Ok. Decime tu DNI o nombre y te propongo 2 horarios (demo).`;
-  }
-
-  return `Te leo. Para avanzar rápido: respondé "reservar", "reprogramar" o "cancelar".`;
+function createHandoff(phone, reason, context) {
+  const h = { id: uid(), clinic_id: CLINIC.id, user_phone: phone, reason, context, status: "open", created_at: nowISO() };
+  store.handoffs.unshift(h);
+  return h;
 }
 
-async function waSendText(to, body) {
-  if (!WA_ACCESS_TOKEN || !WA_PHONE_NUMBER_ID) {
-    return { ok: false, error: "wa_not_configured" };
-  }
-
-  const url = `https://graph.facebook.com/${WA_GRAPH_VERSION}/${WA_PHONE_NUMBER_ID}/messages`;
-  const payload = {
-    messaging_product: "whatsapp",
-    to,
-    type: "text",
-    text: { body: body.slice(0, 3900) },
-  };
-
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      "authorization": `Bearer ${WA_ACCESS_TOKEN}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
-
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) {
-    return { ok: false, status: resp.status, data };
-  }
-  return { ok: true, data };
+function createPayLink(appointmentId, amount) {
+  // (En prod sería tu link real, esto es demo)
+  return `http://localhost:${PORT}/api/dev/paylink?ref=${encodeURIComponent(appointmentId)}&amount=${encodeURIComponent(amount)}`;
 }
 
-function logMessage(channel, from, textBody) {
-  store.messages.push({ ts: nowISO(), from, text: textBody, channel });
-  if (store.messages.length > 500) store.messages.shift();
-}
+async function handleIncomingText(phone, textIn) {
+  const { key, convo } = getOrCreateConversation(CLINIC.id, phone);
+  const state = convo.state || {};
+  const msg = (textIn || "").trim();
+  const intent = detectIntent(msg);
 
-// ------------------ API routes ------------------
-async function handleApi(req, res) {
-  const u = new URL(req.url, `http://localhost:${PORT}`);
-  const p = u.pathname;
-
-  if (p === "/api/health") {
-    return json(res, 200, { ok: true, clinic: CLINIC_NAME, time: nowISO() });
+  if (intent === "human") {
+    createHandoff(phone, "User requested human", { lastMessage: msg, state });
+    updateConversation(key, { last_intent: "human", state: {} });
+    return ["Perfecto. Te paso con recepción ✅ (ya tienen todo el contexto)."];
   }
 
-  if (p === "/api/admin/state") {
-    return json(res, 200, { ok: true, store });
+  if (!state.stage) {
+    updateConversation(key, { state: { stage: "menu" }, last_intent: intent });
+    return [menu()];
   }
 
-  // WhatsApp webhook verify (GET)
-  if (p === "/api/whatsapp" && req.method === "GET") {
-    const mode = u.searchParams.get("hub.mode");
-    const token = u.searchParams.get("hub.verify_token");
-    const challenge = u.searchParams.get("hub.challenge");
-
-    if (mode === "subscribe" && token === WA_VERIFY_TOKEN && challenge) {
-      res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
-      return res.end(challenge);
+  if (state.stage === "menu") {
+    if (intent === "reserve") {
+      updateConversation(key, { state: { stage: "reserve_service" }, last_intent: "reserve" });
+      return ["Genial. ¿Qué necesitás?\n1) EcoDoppler\n2) Holter\n3) ECG\n4) Consulta"];
     }
-    return text(res, 403, "Forbidden");
+    if (intent === "reschedule") {
+      updateConversation(key, { state: { stage: "reschedule" }, last_intent: "reschedule" });
+      return ["Pasame tu DNI o el nombre + día del turno y te lo reprogramo."];
+    }
+    if (intent === "cancel") {
+      updateConversation(key, { state: { stage: "cancel" }, last_intent: "cancel" });
+      return ["Pasame tu DNI o el nombre + día del turno y lo cancelo."];
+    }
+    return ["No te entendí 😅 Respondé con 1, 2, 3 o 4.", menu()];
   }
 
-  // WhatsApp webhook receive (POST)
-  if (p === "/api/whatsapp" && req.method === "POST") {
-    const raw = await readBody(req).catch((e) => {
-      if (String(e.message) === "payload_too_large") return null;
-      throw e;
+  if (state.stage === "reserve_service") {
+    const serviceMap = { "1": "EcoDoppler", "2": "Holter", "3": "ECG", "4": "Consulta" };
+    const service = serviceMap[msg] || (msg.length > 2 ? msg : "");
+    if (!service) return ["Elegí 1–4 o escribime el estudio/consulta."];
+    updateConversation(key, { state: { stage: "reserve_location", service }, last_intent: "reserve" });
+    return ["Perfecto. ¿En qué sede?\n1) Centro\n2) Luján"];
+  }
+
+  if (state.stage === "reserve_location") {
+    const location = msg === "1" ? "Centro" : msg === "2" ? "Luján" : msg;
+    if (!location) return ["Decime 1, 2 o escribime la sede."];
+    updateConversation(key, { state: { stage: "reserve_coverage", service: state.service, location }, last_intent: "reserve" });
+    return ["Perfecto.\n¿Cómo es tu atención?\n1) Obra social\n2) Particular"];
+  }
+
+  if (state.stage === "reserve_coverage") {
+    const coverage =
+      msg === "1" ? "obra_social" :
+      msg === "2" ? "particular" :
+      (msg.toLowerCase().includes("obra") ? "obra_social" : "particular");
+
+    const slots = getMockSlots();
+    updateConversation(key, { state: { stage: "reserve_slot", service: state.service, location: state.location, coverage, slots }, last_intent: "reserve" });
+    return [`Listo. Para ${state.service} en ${state.location}, tengo:\n${slots.map(s => s.label).join("\n")}\nRespondé A, B o C.`];
+  }
+
+  if (state.stage === "reserve_slot") {
+    const pick = msg.toUpperCase();
+    const idx = pick === "A" ? 0 : pick === "B" ? 1 : pick === "C" ? 2 : -1;
+    if (idx < 0) return ["Respondé A, B o C 🙌"];
+
+    const chosen = state.slots[idx];
+    const isObra = state.coverage === "obra_social";
+    const amount = isObra ? CLINIC.deposit_obrasocial : CLINIC.deposit_other;
+
+    const depositText = isObra
+      ? "Seña reintegrable: $5.000 (se reintegra el día del turno presentándote en recepción)."
+      : "Seña: $10.000 para confirmar el turno.";
+
+    const appt = createHeldAppointment({
+      phone,
+      service: state.service,
+      location: state.location,
+      coverage: state.coverage,
+      deposit_amount: amount,
+      start_at: chosen.iso
     });
-    if (raw == null) return badRequest(res, "payload_too_large");
 
-    const payload = safeJsonParse(raw);
-    // Always 200 to acknowledge quickly (Meta expects this)
-    json(res, 200, { ok: true });
+    const payUrl = createPayLink(appt.id, amount);
+    updateConversation(key, { state: { stage: "await_payment", appointmentId: appt.id }, last_intent: "reserve" });
 
-    // Process async (don't block the response)
-    setImmediate(async () => {
-      try {
-        const entry = payload && payload.entry && payload.entry[0];
-        const change = entry && entry.changes && entry.changes[0];
-        const value = change && change.value;
-        const messages = value && value.messages;
+    return [
+      `Perfecto ✅\nTurno: ${state.service} · ${state.location}\n${depositText}\nPagás acá: ${payUrl}\nApenas se acredita te confirmo por acá.`
+    ];
+  }
 
-        if (!Array.isArray(messages) || messages.length === 0) return;
+  if (state.stage === "await_payment") {
+    return ["Estoy esperando la acreditación 👀\nSi querés cancelar o hablar con recepción: respondé 3 o 4."];
+  }
 
-        for (const m of messages) {
-          const from = m.from || "unknown";
-          const userText = pickTextFromWAMessage(m);
+  updateConversation(key, { state: { stage: "menu" }, last_intent: null });
+  return [menu()];
+}
 
-          logMessage("whatsapp", from, userText);
+function serveStatic(req, res, pathname) {
+  const fileMap = {
+    "/": "public/index.html",
+    "/admin": "public/admin.html",
+    "/styles.css": "public/styles.css",
+    "/app.js": "public/app.js",
+    "/admin.js": "public/admin.js",
+  };
 
-          const reply = buildAutoReply(userText);
+  const rel = fileMap[pathname];
+  if (!rel) return false;
 
-          // If reply contains deposit hint, we can also include a demo URL
-          let finalReply = reply;
-          if (reply.includes("link de seña")) {
-            finalReply = `${reply}\n\nLink (demo): http://localhost:${PORT}/?deposit=1`;
-          }
+  const abs = path.join(__dirname, rel);
+  if (!fs.existsSync(abs)) return false;
 
-          const sent = await waSendText(from, finalReply);
-          logMessage("whatsapp-out", from, `[sent=${sent.ok}] ${finalReply}`);
-        }
-      } catch (err) {
-        // best-effort logging
-        logMessage("system", "server", `wa_handler_error: ${String(err && err.message || err)}`);
+  const ext = path.extname(abs).toLowerCase();
+  const ct =
+    ext === ".html" ? "text/html; charset=utf-8" :
+    ext === ".css" ? "text/css; charset=utf-8" :
+    ext === ".js" ? "application/javascript; charset=utf-8" :
+    "application/octet-stream";
+
+  const data = fs.readFileSync(abs);
+  res.writeHead(200, { "Content-Type": ct, "Cache-Control": "no-store" });
+  res.end(data);
+  return true;
+}
+
+// ====== WhatsApp Cloud API sender (Graph) ======
+function sendWhatsAppText(to, bodyText) {
+  return new Promise((resolve) => {
+    if (!WA_ACCESS_TOKEN || !WA_PHONE_NUMBER_ID) {
+      console.log("[WA OUT SKIP] Missing WA_ACCESS_TOKEN / WA_PHONE_NUMBER_ID", {
+        hasToken: !!WA_ACCESS_TOKEN,
+        phoneNumberId: WA_PHONE_NUMBER_ID ? "set" : "missing",
+      });
+      return resolve({ ok: false, skipped: true });
+    }
+
+    const payload = JSON.stringify({
+      messaging_product: "whatsapp",
+      to,
+      type: "text",
+      text: { body: bodyText }
+    });
+
+    const options = {
+      hostname: "graph.facebook.com",
+      path: `/v20.0/${WA_PHONE_NUMBER_ID}/messages`,
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${WA_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(payload)
       }
+    };
+
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (c) => data += c);
+      res.on("end", () => {
+        const ok = res.statusCode >= 200 && res.statusCode < 300;
+        console.log("[WA OUT]", res.statusCode, ok ? "OK" : "FAIL", data?.slice?.(0, 400));
+        resolve({ ok, status: res.statusCode, data });
+      });
     });
 
-    return;
+    req.on("error", (err) => {
+      console.log("[WA OUT ERROR]", err.message);
+      resolve({ ok: false, error: err.message });
+    });
+
+    req.write(payload);
+    req.end();
+  });
+}
+
+function redact(s) {
+  if (!s) return "";
+  if (s.length <= 10) return "***";
+  return s.slice(0, 6) + "..." + s.slice(-4);
+}
+
+const server = http.createServer(async (req, res) => {
+  console.log("[REQ]", req.method, req.url);
+
+  const parsed = url.parse(req.url, true);
+  const pathname = parsed.pathname || "/";
+
+  if (serveStatic(req, res, pathname)) return;
+
+  // ---- debug env (safe) ----
+  if (req.method === "GET" && pathname === "/api/debug/env") {
+    return json(res, 200, {
+      ok: true,
+      PORT,
+      WA_VERIFY_TOKEN: redact(WA_VERIFY_TOKEN),
+      WA_ACCESS_TOKEN: redact(WA_ACCESS_TOKEN),
+      WA_PHONE_NUMBER_ID: WA_PHONE_NUMBER_ID ? "set" : "missing",
+      WA_PHONE_NUMBER_ID_value: WA_PHONE_NUMBER_ID ? redact(WA_PHONE_NUMBER_ID) : "",
+    });
   }
 
-  // Mercado Pago webhook placeholder (POST)
-  if (p === "/api/mp/webhook" && req.method === "POST") {
-    // Store raw for later reconciliation (demo)
-    const raw = await readBody(req).catch(() => "");
-    logMessage("mp", "webhook", raw.slice(0, 5000));
+  // ---- debug: force send ----
+  if (req.method === "POST" && pathname === "/api/debug/wa-send") {
+    const raw = await readBody(req);
+    const body = safeJsonParse(raw) || {};
+    const to = body.to;
+    const message = body.message || "ping desde Render ✅";
+    if (!to) return json(res, 400, { ok: false, error: "missing to" });
+    const r = await sendWhatsAppText(String(to), String(message));
+    return json(res, 200, { ok: true, result: r });
+  }
+
+  if (req.method === "GET" && pathname === "/api/health") {
+    return json(res, 200, { ok: true, clinic: CLINIC.name, time: nowISO() });
+  }
+
+  // WhatsApp verify (Cloud API)
+  if (req.method === "GET" && pathname === "/api/whatsapp") {
+    const mode = parsed.query["hub.mode"];
+    const token = parsed.query["hub.verify_token"];
+    const challenge = parsed.query["hub.challenge"];
+    console.log("[WA VERIFY]", { mode, token: redact(token), expected: redact(WA_VERIFY_TOKEN) });
+
+    if (mode === "subscribe" && token === WA_VERIFY_TOKEN) {
+      return text(res, 200, String(challenge || ""));
+    }
+    return json(res, 403, { ok: false });
+  }
+
+  // WhatsApp inbound (Cloud payload)
+  if (req.method === "POST" && pathname === "/api/whatsapp") {
+    const raw = await readBody(req);
+    const body = safeJsonParse(raw) || {};
+
+    const value = body?.entry?.[0]?.changes?.[0]?.value;
+    const msg = value?.messages?.[0];
+
+    const from = msg?.from || null;
+    const textIn = msg?.type === "text" ? msg.text?.body : null;
+
+    console.log("[WA POST RAW]", raw?.slice?.(0, 400));
+
+    // Meta manda muchos eventos que NO son mensajes
+    if (!from || !textIn) return json(res, 200, { ok: true });
+
+    console.log("[WA IN]", from, textIn);
+
+    const replies = await handleIncomingText(from, textIn);
+
+    for (const r of replies) {
+      await sendWhatsAppText(from, r);
+    }
+
     return json(res, 200, { ok: true });
   }
 
-  return notFound(res);
-}
+  // Mercado Pago webhook (placeholder)
+  if (req.method === "POST" && pathname === "/api/mp/webhook") {
+    const raw = await readBody(req);
+    const body = safeJsonParse(raw) || {};
+    console.log("[MP WEBHOOK]", body);
 
-// ------------------ Main server ------------------
-const server = http.createServer(async (req, res) => {
-  try {
-    const u = new URL(req.url, `http://localhost:${PORT}`);
+    const appointmentId = body.external_reference || body.appointmentId || null;
+    const status = body.status || null;
+    const paymentRef = body.id || body.paymentRef || "mp-demo";
 
-    if (u.pathname.startsWith("/api/")) {
-      return await handleApi(req, res);
+    if (appointmentId && status === "approved") {
+      markAppointmentPaid(String(appointmentId), String(paymentRef));
     }
-
-    return serveStatic(req, res);
-  } catch (err) {
-    return json(res, 500, { ok: false, error: "server_error", detail: String(err && err.message || err) });
+    return json(res, 200, { ok: true });
   }
+
+  res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify({ ok: false, error: "not_found" }));
 });
 
 server.listen(PORT, () => {
   console.log(`[Recepción Autopilot] running on http://localhost:${PORT}`);
-  console.log(`[Recepción Autopilot] clinic = ${CLINIC_NAME}`);
+  console.log(`[Recepción Autopilot] clinic = ${CLINIC.name}`);
   console.log(`[Recepción Autopilot] webhook = /api/whatsapp (verify+messages)`);
+
+  console.log("[BOOT ENV]", {
+    has_WA_ACCESS_TOKEN: !!WA_ACCESS_TOKEN,
+    has_WA_VERIFY_TOKEN: !!WA_VERIFY_TOKEN,
+    has_WA_PHONE_NUMBER_ID: !!WA_PHONE_NUMBER_ID,
+    WA_PHONE_NUMBER_ID_preview: redact(WA_PHONE_NUMBER_ID)
+  });
+
+  if (!WA_ACCESS_TOKEN || !WA_PHONE_NUMBER_ID) {
+    console.log("⚠️ Missing WA_ACCESS_TOKEN or WA_PHONE_NUMBER_ID. Incoming will be handled but replies won't be sent.");
+  }
 });
