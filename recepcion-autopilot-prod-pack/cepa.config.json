@@ -1,0 +1,46 @@
+{
+  "clinic": {
+    "name": "CEPA Centro Médico",
+    "short": "CEPA",
+    "address": "Constitución 46, Luján de Cuyo, Mendoza",
+    "hours": "Lunes a sábados 07:30 a 21:00",
+    "booking_url": "https://www.mrturno.com/m/@cepa",
+    "contact": {
+      "email": "cepadiagnosticomedicointegral@gmail.com",
+      "tel": "261-4987007",
+      "whatsapp_alt": "2613640994"
+    }
+  },
+  "prepagas": [
+    "OSDE", "Swiss Medical", "Galeno", "Medifé", "OMINT", "SanCor Salud", "Jerárquicos Salud", "Prevención Salud", "Andes Salud", "Nobis"
+  ],
+  "studies": [
+    "Mamografía", "Radiología", "Ecografía general", "Ecografía 5D", "Ecodoppler Color",
+    "Ecocardiograma Doppler Color", "ECG", "MAPA (Presurometría)", "Ergometría", "Holter",
+    "Laboratorio", "PAP/Colposcopía", "Poligrafía respiratoria", "Espirometría",
+    "Audiometría/Logo", "Impedanciometría", "BERA/OEA"
+  ],
+  "services_menu": [
+    { "key": "A", "label": "Ecografía / Doppler" },
+    { "key": "B", "label": "Mamografía / Radiología" },
+    { "key": "C", "label": "Cardiología (ECG / Holter / Ergometría / MAPA)" },
+    { "key": "D", "label": "Laboratorio" },
+    { "key": "E", "label": "Ginecología (PAP/Colpo)" },
+    { "key": "F", "label": "Neumo (Espirometría / Poligrafía)" },
+    { "key": "G", "label": "ORL / Audiología (BERA/OEA)" },
+    { "key": "H", "label": "Pediatría" },
+    { "key": "I", "label": "Dermatología" },
+    { "key": "J", "label": "Traumatología" },
+    { "key": "K", "label": "Nutrición / Psicología / Fono" },
+    { "key": "L", "label": "Otro" }
+  ],
+  "handoff_keywords": [
+    "recepcion","humano","secretaria","persona","urgente","dolor","sangrado","embarazo",
+    "botox","relleno","hilos","peeling","mesoterapia","plasma","estetica"
+  ],
+  "deposit": {
+    "enabled": false,
+    "amount_ars": 5000,
+    "note": "Si tu estudio requiere seña, recepción te lo indica y te envía el link."
+  }
+}
