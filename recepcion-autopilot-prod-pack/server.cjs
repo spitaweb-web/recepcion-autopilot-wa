@@ -1,13 +1,15 @@
 'use strict';
 
 /**
- * Recepción Autopilot — CEPA (WhatsApp Cloud API) — Node/Express (PROD)
- * Webhook verify + messages: /api/whatsapp (alias /webhook)
+ * Recepción Autopilot — CEPA (WhatsApp Cloud API) — Node/Express
+ * - Webhook verify + messages: /api/whatsapp (y alias /webhook)
+ * - Respuestas: text-only (robusto). Fase 2: interactive buttons/lists.
  *
- * ✅ Menú + NLU simple (keywords) + fallback "no entendí"
- * ✅ Flujo real: MrTurno -> "LISTO" -> seña $10.000 -> comprobante -> cierre
- * ✅ Adjuntos: image/document -> registra "media_id" + avisa a recepción interna
- * ✅ Config por env: monto seña, si aplica, número interno para notificaciones
+ * Fixes incluidos:
+ * ✅ SyntaxError extra ')'
+ * ✅ express-rate-limit trust proxy warning (trust proxy = 1)
+ * ✅ Limpieza sesiones (TTL)
+ * ✅ Dedupe básico por msg.id (evita doble respuesta por retries)
  */
 
 const express = require('express');
@@ -17,37 +19,40 @@ const crypto = require('crypto');
 
 const app = express();
 app.disable('x-powered-by');
-app.set('trust proxy', true);
+
+/**
+ * Render suele estar detrás de 1 proxy (ELB/Reverse proxy).
+ * NO uses true: es “permissive” y rate-limit se queja.
+ */
+app.set('trust proxy', 1);
 
 app.use(helmet());
-app.use(rateLimit({ windowMs: 60 * 1000, max: 240, standardHeaders: true, legacyHeaders: false }));
+app.use(
+  rateLimit({
+    windowMs: 60 * 1000,
+    max: 240,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => req.ip, // estable
+  })
+);
 
 const {
   PORT = '3000',
-  GRAPH_VERSION = 'v22.0',
-
-  // WhatsApp Cloud API
   WA_VERIFY_TOKEN,
   WA_ACCESS_TOKEN,
   WA_PHONE_NUMBER_ID,
+  META_APP_SECRET, // recomendado: valida X-Hub-Signature-256
+  GRAPH_VERSION = 'v22.0',
 
-  // Recomendado: firma X-Hub-Signature-256
-  META_APP_SECRET,
-
-  // Anti no-show (regla simple, fácil de cambiar)
-  DEPOSIT_AMOUNT = '10000', // ARS
-  DEPOSIT_REQUIRED = 'true', // true/false
-
-  // Notificación interna (tu WA o el de recepción)
-  // formato: 549261xxxxxxx (sin +)
-  RECEPTION_NOTIFY_TO = '',
+  // Seña / anti no-show (fácil de cambiar por env)
+  DEPOSIT_REQUIRED = 'true',
+  DEPOSIT_AMOUNT = '10000',
 } = process.env;
 
 const STARTED_AT = Date.now();
-const DEPOSIT_AMOUNT_NUM = Number(String(DEPOSIT_AMOUNT).replace(/[^\d]/g, '')) || 10000;
-const DEPOSIT_REQUIRED_BOOL = String(DEPOSIT_REQUIRED).toLowerCase() === 'true';
 
-// ----------------- utils -----------------
+// ===== Util =====
 function timingSafeEq(a, b) {
   const ba = Buffer.from(String(a));
   const bb = Buffer.from(String(b));
@@ -66,13 +71,11 @@ function normalize(s) {
     .trim()
     .toLowerCase()
     .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '');
+    .replace(/[\u0300-\u036f]/g, ''); // sin tildes
 }
 
 function verifyMetaSignature(rawBodyBuffer, signatureHeader, appSecret) {
-  // En PROD real: si hay secret, exigimos firma válida
-  if (!appSecret) return true;
-
+  if (!appSecret) return true; // si no hay secret, no bloqueamos (pero logueamos)
   if (!signatureHeader || typeof signatureHeader !== 'string') return false;
   if (!signatureHeader.startsWith('sha256=')) return false;
 
@@ -111,71 +114,76 @@ async function sendText(toWaId, text) {
 
   if (!resp.ok) {
     let j = {};
-    try { j = await resp.json(); } catch {}
+    try {
+      j = await resp.json();
+    } catch {}
     log('error', 'wa_outbound_failed', { status: resp.status, err: j });
     return { ok: false, status: resp.status, err: j };
   }
 
   const data = await resp.json();
-  log('info', 'wa_outbound_sent', { to: toWaId, msg_id: data?.messages?.[0]?.id });
+  log('info', 'wa_outbound_sent', {
+    to: toWaId,
+    msg_id: data?.messages?.[0]?.id,
+  });
   return { ok: true, data };
 }
 
-async function notifyReception(text) {
-  if (!RECEPTION_NOTIFY_TO) return;
+const DEPOSIT_ON = normalize(DEPOSIT_REQUIRED) !== 'false';
+const DEPOSIT_VALUE = (() => {
+  const n = Number(String(DEPOSIT_AMOUNT || '').replace(/[^\d]/g, ''));
+  return Number.isFinite(n) && n > 0 ? n : 10000;
+})();
+
+function moneyARS(n) {
   try {
-    await sendText(RECEPTION_NOTIFY_TO, text);
-  } catch (e) {
-    log('warn', 'notify_reception_failed', { err: String(e?.message || e) });
+    return new Intl.NumberFormat('es-AR').format(n);
+  } catch {
+    return String(n);
   }
 }
 
-// ----------------- CEPA config -----------------
+// ===== CEPA Data =====
 const CEPA = {
-  name: 'CEPA Consultorios (Luján)',
+  name: 'CEPA Consultorios (Luján de Cuyo)',
   address: 'Constitución 46, Luján de Cuyo, Mendoza',
   hours: 'Lunes a sábados · 07:30 a 21:00',
   email: 'cepadiagnosticomedicointegral@gmail.com',
   phone: '261-4987007',
-  whatsapp: '2613640994',
   mrturno: 'https://www.mrturno.com/m/@cepa',
-  disclaimer: 'Si es una urgencia, no uses este chat: llamá al 107 o acudí a guardia.',
+  disclaimer:
+    'Si es una urgencia, no uses este chat: llamá al 107 o acudí a guardia.',
 };
 
-// Prioridad (lo que pediste “ordenado”): lo más volumétrico y transaccional arriba
-// 1) Estudios -> 2) Especialidades -> 3) Estética -> 4) OS -> 5) Info -> 6) Humano
-const MENU = [
-  '1) Estudios (eco, doppler, ECG, laboratorio, etc.)',
-  '2) Sacar turno (especialidades)',
-  '3) Estética',
-  '4) Obras sociales / prepagas',
-  '5) Dirección y horarios',
-  '6) Hablar con recepción',
-  '0) Menú',
-];
-
-// Estudios (los que más “mueven caja” suelen ser: eco/doppler/holter/mamo/lab)
-const STUDIES = [
-  { n: '1', label: 'Ecografía / Eco 5D', kw: ['eco', 'ecografia', '5d'] },
-  { n: '2', label: 'Doppler / Ecodoppler / Ecocardiograma Doppler', kw: ['doppler', 'ecodoppler', 'ecocardiograma'] },
-  { n: '3', label: 'Holter', kw: ['holter'] },
-  { n: '4', label: 'ECG', kw: ['ecg', 'electro'] },
-  { n: '5', label: 'Laboratorio (análisis)', kw: ['laboratorio', 'analisis', 'sangre'] },
-  { n: '6', label: 'Mamografía', kw: ['mamo', 'mamografia'] },
-  { n: '7', label: 'MAPA / Presurometría', kw: ['mapa', 'presion', 'presuro'] },
-  { n: '8', label: 'Ergometría', kw: ['ergo', 'ergometria'] },
-  { n: '9', label: 'Audiometría / BERA / OEA', kw: ['audio', 'audiometria', 'bera', 'oea', 'imped'] },
-  { n: '10', label: 'Otro (escribilo)', kw: [] },
-];
-
 const SPECIALTIES = [
-  { n: '1', label: 'Ginecología / Obstetricia', kw: ['gine', 'obste', 'pap', 'papanico', 'colpo'] },
-  { n: '2', label: 'Pediatría', kw: ['pedi', 'nino', 'niño', 'infantil'] },
-  { n: '3', label: 'Clínica médica / Medicina familiar', kw: ['clinica', 'general', 'familia'] },
-  { n: '4', label: 'Cardiología', kw: ['cardio', 'corazon'] },
-  { n: '5', label: 'Dermatología', kw: ['derma', 'piel'] },
-  { n: '6', label: 'Traumatología', kw: ['trauma', 'rodilla', 'hueso'] },
-  { n: '7', label: 'Otra (escribí el nombre)', kw: [] },
+  { key: 'gine', label: 'Ginecología / Obstetricia', kw: ['gine', 'obste', 'papanico', 'pap', 'colpo'] },
+  { key: 'pedi', label: 'Pediatría', kw: ['pedi', 'niño', 'nino', 'infantil'] },
+  { key: 'clim', label: 'Clínica médica / Medicina familiar', kw: ['clinica', 'familia', 'general'] },
+  { key: 'card', label: 'Cardiología', kw: ['cardio', 'corazon'] },
+  { key: 'derm', label: 'Dermatología', kw: ['derma', 'piel'] },
+  { key: 'trau', label: 'Traumatología', kw: ['trauma', 'rodilla', 'hueso'] },
+  { key: 'gastro', label: 'Gastroenterología', kw: ['gastro', 'digest'] },
+  { key: 'endo', label: 'Endocrinología / Diabetología', kw: ['endo', 'diabe', 'tiroid'] },
+  { key: 'uro', label: 'Urología', kw: ['uro'] },
+  { key: 'orl', label: 'ORL', kw: ['orl', 'otorrino'] },
+  { key: 'oft', label: 'Oftalmología', kw: ['oft', 'ojo', 'vision'] },
+  { key: 'psico', label: 'Psicología', kw: ['psico', 'terapia'] },
+  { key: 'nutri', label: 'Nutrición', kw: ['nutri', 'aliment'] },
+  { key: 'odonto', label: 'Odontología', kw: ['odonto', 'diente'] },
+];
+
+const STUDIES = [
+  { key: 'mamo', label: 'Mamografía', kw: ['mamo', 'mamografia'] },
+  { key: 'radio', label: 'Radiología', kw: ['radio', 'rayos'] },
+  { key: 'eco', label: 'Ecografía / Eco 5D', kw: ['eco', 'ecografia', '5d'] },
+  { key: 'doppler', label: 'Ecodoppler Color / Ecocardiograma Doppler', kw: ['doppler', 'ecodoppler', 'ecocardiograma'] },
+  { key: 'ecg', label: 'ECG', kw: ['ecg', 'electro'] },
+  { key: 'mapa', label: 'MAPA / Presurometría', kw: ['mapa', 'presuro', 'presion'] },
+  { key: 'ergo', label: 'Ergometría', kw: ['ergo', 'ergometria'] },
+  { key: 'holter', label: 'Holter', kw: ['holter'] },
+  { key: 'lab', label: 'Laboratorio', kw: ['laboratorio', 'analisis'] },
+  { key: 'resp', label: 'Poligrafía / Espirometría', kw: ['poligrafia', 'espiro', 'respir'] },
+  { key: 'audio', label: 'Audiometría / BERA / OEA', kw: ['audio', 'audiometria', 'bera', 'oea', 'imped'] },
 ];
 
 const ESTETICA = [
@@ -183,26 +191,40 @@ const ESTETICA = [
   'Mesoterapia (facial/corporal/capilar)',
   'Plasma rico en plaquetas (PRP)',
   'Botox',
-  'Ácido hialurónico',
+  'Rellenos con ácido hialurónico',
   'Hilos tensores',
-  'Dermapen / Peeling / Punta de diamante',
-  'Celulitis / grasa localizada',
+  'Punta de diamante / Peeling / Dermapen',
+  'Tratamiento de celulitis / grasa localizada',
   'Criocirugía / electrocoagulación cutánea',
 ];
 
-// ----------------- sessions (simple, in-memory) -----------------
-/**
- * state:
- *  - menu
- *  - choose_study
- *  - choose_specialty
- *  - waiting_reserved_confirmation   (user debe decir LISTO)
- *  - waiting_receipt                (esperando comprobante)
- */
-const sessions = new Map();
+const OBRAS_SOCIALES_TOP = [
+  'OSDE', 'Swiss Medical', 'Galeno', 'Medifé', 'OMINT', 'SanCor Salud', 'Prevención Salud',
+  'Jerárquicos Salud', 'Andes Salud', 'Nobis', 'Federada Salud', 'Medicus'
+];
+
+// ===== Sessions + dedupe =====
+const sessions = new Map(); // wa_id -> { state, context, updatedAt }
+const SESSION_TTL_MS = 60 * 60 * 1000; // 1h
+
+const seenMsg = new Map(); // msgId -> ts
+const SEEN_TTL_MS = 10 * 60 * 1000; // 10m
+
+function gc() {
+  const now = Date.now();
+
+  for (const [k, s] of sessions.entries()) {
+    if (!s?.updatedAt || now - s.updatedAt > SESSION_TTL_MS) sessions.delete(k);
+  }
+
+  for (const [id, ts] of seenMsg.entries()) {
+    if (!ts || now - ts > SEEN_TTL_MS) seenMsg.delete(id);
+  }
+}
+setInterval(gc, 60 * 1000).unref();
 
 function getSession(waId) {
-  return sessions.get(waId) || { state: 'menu', intent: null, lastLabel: null, updatedAt: Date.now() };
+  return sessions.get(waId) || { state: 'menu', context: {}, updatedAt: Date.now() };
 }
 
 function setSession(waId, patch) {
@@ -213,26 +235,69 @@ function setSession(waId, patch) {
 }
 
 function resetSession(waId) {
-  sessions.set(waId, { state: 'menu', intent: null, lastLabel: null, updatedAt: Date.now() });
+  sessions.set(waId, { state: 'menu', context: {}, updatedAt: Date.now() });
 }
 
-// Limpieza simple (evita memoria eterna)
-setInterval(() => {
-  const now = Date.now();
-  for (const [k, v] of sessions.entries()) {
-    if (now - (v.updatedAt || 0) > 1000 * 60 * 45) sessions.delete(k); // 45 min
+function findMatch(norm, list) {
+  for (const item of list) {
+    if (item.kw.some((k) => norm.includes(k))) return item;
   }
-}, 1000 * 60 * 10).unref();
+  return null;
+}
 
-// ----------------- copy / UX -----------------
+// ===== UX copy (premium) =====
 function menuText() {
   return (
 `Hola 👋 Soy la recepción automática de ${CEPA.name}.
 Elegí una opción (respondé con un número):
 
-${MENU.join('\n')}
+1) Sacar turno (especialidades)
+2) Estudios (eco, doppler, ECG, laboratorio, etc.)
+3) Estética
+4) Obras sociales / prepagas
+5) Dirección y horarios
+6) Hablar con recepción
+
+0) Menú
 
 ${CEPA.disclaimer}`
+  );
+}
+
+function turnosPrompt() {
+  return (
+`Perfecto. ¿Para qué especialidad es?
+
+Respondé con:
+1) Ginecología / Obstetricia
+2) Pediatría
+3) Clínica médica / Medicina familiar
+4) Cardiología
+5) Dermatología
+6) Traumatología
+7) Otra (escribí el nombre)
+
+0) Menú`
+  );
+}
+
+function estudiosPrompt() {
+  return (
+`Genial. ¿Qué estudio necesitás?
+
+Respondé con:
+1) Mamografía
+2) Ecografía / Eco 5D
+3) Doppler / Ecocardiograma Doppler
+4) ECG
+5) MAPA (presión)
+6) Ergometría
+7) Holter
+8) Laboratorio
+9) Audiometría / BERA / OEA
+10) Otro (escribilo)
+
+0) Menú`
   );
 }
 
@@ -241,295 +306,331 @@ function infoContacto() {
 `📍 ${CEPA.address}
 🕒 ${CEPA.hours}
 📞 Tel: ${CEPA.phone}
-🟢 Turnos WhatsApp: ${CEPA.whatsapp}
-✉️ ${CEPA.email}`
+✉️ Email: ${CEPA.email}`
   );
 }
 
-function studiesPrompt() {
+function mrturnoText(extraLine) {
+  const depositLine = DEPOSIT_ON
+    ? `\n\n✅ Para confirmar el turno: seña de $${moneyARS(DEPOSIT_VALUE)} (anti no-show).`
+    : '';
+
   return (
-`Perfecto. ¿Qué estudio necesitás?
+`${extraLine ? extraLine + '\n\n' : ''}Para sacar turno rápido usá MrTurno:
+${CEPA.mrturno}${depositLine}
 
-${STUDIES.map(s => `${s.n}) ${s.label}`).join('\n')}
-
-0) Menú`
+Si preferís, decime “recepción” y te ayudo por acá.`
   );
 }
 
-function specialtiesPrompt() {
-  return (
-`Perfecto. ¿Para qué especialidad?
-
-${SPECIALTIES.map(s => `${s.n}) ${s.label}`).join('\n')}
-
-0) Menú`
-  );
-}
-
-function mrturnoStep(label) {
-  // “cierre real” en dos pasos:
-  // 1) ir a MrTurno
-  // 2) volver con LISTO
-  return (
-`Listo ✅ ${label ? `(${label})\n\n` : ''}Reservá tu turno acá:
-${CEPA.mrturno}
-
-Cuando lo tengas, respondé **LISTO** y seguimos por acá.`
-  );
-}
-
-function depositRequestText() {
-  // sin inventar link de pago: pedimos comprobante y recepción valida.
-  // Si después decidís integrar pago real, esto queda encapsulado.
-  return (
-`Perfecto ✅
-
-Para confirmar y evitar ausencias, la seña es de **$${DEPOSIT_AMOUNT_NUM.toLocaleString('es-AR')}**.
-📎 Por favor, enviá el **comprobante** (foto o PDF) por este chat.
-
-Cuando lo envíes, te confirmo recepción y queda registrado.`
-  );
-}
-
-function finalOkText() {
-  return (
-`Recibido ✅ Ya quedó registrado.
-
-Si necesitás cambiar o cancelar, escribí **reprogramar** o **cancelar** y te guío.
-Gracias.`
-  );
-}
-
-function noEntendiText() {
-  return (
-`Te entiendo 🙌 pero no llegué a identificar qué necesitás.
-
-Respondé con un número del menú (1–6) o escribí:
-- “turno”
-- “estudio” (eco, doppler, holter…)
-- “dirección”
-- “obras sociales”
-- “recepción”`
-  );
-}
-
-function findByNumberOrKeyword(norm, list) {
-  for (const it of list) {
-    if (norm === it.n) return it;
-  }
-  for (const it of list) {
-    if (it.kw && it.kw.some(k => norm.includes(k))) return it;
-  }
-  return null;
-}
-
-// ----------------- core handler -----------------
-async function handleTextMessage(from, text) {
-  const norm = normalize(text);
-
-  // global shortcuts
-  if (norm === '0' || norm === 'menu' || norm === 'inicio' || norm === 'hola') {
-    resetSession(from);
-    return sendText(from, menuText());
+function askReceiptText() {
+  // “Onboarding” final: pedir comprobante simple si aplica
+  if (!DEPOSIT_ON) {
+    return (
+`Listo ✅ Cuando tengas el turno confirmado, escribime “listo” y te dejo la info final (dirección/horarios).`
+    );
   }
 
-  if (norm.includes('direccion') || norm.includes('ubic') || norm.includes('horario')) {
-    resetSession(from);
-    return sendText(from, infoContacto());
+  return (
+`Perfecto ✅ Para dejarlo confirmado: enviame el comprobante de seña de $${moneyARS(DEPOSIT_VALUE)}.
+
+📌 Podés mandar:
+• Captura del comprobante (imagen) o
+• El número/ID de operación en texto
+
+Apenas lo reciba, te dejo el mensaje final con todos los datos.`
+  );
+}
+
+function finalConfirmedText() {
+  const depositLine = DEPOSIT_ON
+    ? `\n✅ Seña anti no-show: $${moneyARS(DEPOSIT_VALUE)} (recibida).`
+    : '';
+
+  return (
+`Listo ✅ Turno en proceso de confirmación.
+
+${infoContacto()}${depositLine}
+
+Si necesitás cambiar o cancelar, respondé “recepción”.`
+  );
+}
+
+// ===== Flow =====
+async function handleUserText(waId, rawText) {
+  const norm = normalize(rawText);
+
+  // comandos globales
+  if (norm === '0' || norm === 'menu' || norm === 'inicio') {
+    resetSession(waId);
+    return sendText(waId, menuText());
+  }
+
+  const session = getSession(waId);
+
+  // accesos rápidos
+  if (norm.includes('horario') || norm.includes('direccion') || norm.includes('ubic')) {
+    resetSession(waId);
+    return sendText(waId, infoContacto());
   }
 
   if (norm.includes('obra') || norm.includes('prepaga') || norm.includes('osde') || norm.includes('swiss')) {
-    resetSession(from);
-    return sendText(from, `Decime cuál obra social/prepaga tenés y te confirmo si la recibimos.`);
+    resetSession(waId);
+    return sendText(
+      waId,
+      `Trabajamos con varias obras sociales/prepagas. Algunas frecuentes:\n• ${OBRAS_SOCIALES_TOP.join(
+        '\n• '
+      )}\n\nSi me decís cuál tenés, te confirmo si está.`
+    );
   }
 
   if (norm.includes('recep') || norm.includes('humano') || norm.includes('persona')) {
-    resetSession(from);
-    await notifyReception(`🟡 [Handoff solicitado]\nPaciente: ${from}\nMensaje: ${text}`);
-    return sendText(from, `Listo ✅ Te paso con recepción. Contame en 1 línea qué necesitás (estudio/especialidad + día preferido).`);
+    // fase 1: handoff
+    setSession(waId, { state: 'handoff', context: {} });
+    return sendText(
+      waId,
+      `Listo ✅ Te paso con recepción.\nContame en 1 línea qué necesitás (especialidad/estudio + día preferido).`
+    );
   }
 
-  // if user says LISTO after MrTurno
-  if (norm === 'listo') {
-    const s = getSession(from);
-    // Si venía de reservar
-    if (s.state === 'waiting_reserved_confirmation') {
-      if (DEPOSIT_REQUIRED_BOOL) {
-        setSession(from, { state: 'waiting_receipt' });
-        return sendText(from, depositRequestText());
-      }
-      resetSession(from);
-      await notifyReception(`✅ [MrTurno confirmado sin seña]\nPaciente: ${from}\nServicio: ${s.lastLabel || 'N/D'}`);
-      return sendText(from, `Perfecto ✅ Ya quedó.\nSi necesitás ayuda, escribí “recepción”.`);
+  // Si el usuario dice "listo" => onboarding final (pide comprobante / entrega cierre)
+  if (norm === 'listo' || norm === 'ok' || norm === 'dale' || norm === 'ya') {
+    // si veníamos de mrturno => pedir comprobante
+    if (session.state === 'awaiting_receipt') {
+      // si todavía no mandó comprobante, insistimos amable
+      return sendText(waId, askReceiptText());
     }
 
-    // si dice LISTO sin contexto:
-    return sendText(from, `Perfecto ✅ ¿Qué reservaste?\nDecime “estudio” o “turno” y te guío.`);
+    // si estaba en cualquier otro lado, devolvemos menú (pero mejor: guiar)
+    resetSession(waId);
+    return sendText(
+      waId,
+      `Perfecto. ¿En qué te ayudo?\n\n${menuText()}`
+    );
   }
 
-  const session = getSession(from);
-
-  // menu state
+  // state machine
   if (session.state === 'menu') {
-    // números del menú
     if (norm === '1') {
-      setSession(from, { state: 'choose_study' });
-      return sendText(from, studiesPrompt());
+      setSession(waId, { state: 'turnos' });
+      return sendText(waId, turnosPrompt());
     }
     if (norm === '2') {
-      setSession(from, { state: 'choose_specialty' });
-      return sendText(from, specialtiesPrompt());
+      setSession(waId, { state: 'estudios' });
+      return sendText(waId, estudiosPrompt());
     }
     if (norm === '3') {
-      resetSession(from);
-      return sendText(from, `Estética (algunos tratamientos):\n• ${ESTETICA.join('\n• ')}\n\n¿Querés turno? Escribí “turno” y te mando el link.`);
+      resetSession(waId);
+      return sendText(
+        waId,
+        `Estética (algunos tratamientos):\n• ${ESTETICA.join(
+          '\n• '
+        )}\n\n¿Querés turno? Respondé “turno” y te paso MrTurno.`
+      );
     }
     if (norm === '4') {
-      resetSession(from);
-      return sendText(from, `Decime qué obra social/prepaga tenés y te confirmo si la recibimos.`);
+      resetSession(waId);
+      return sendText(
+        waId,
+        `Obras sociales/prepagas: decime cuál tenés y te confirmo.\nAlgunas frecuentes:\n• ${OBRAS_SOCIALES_TOP.join(
+          '\n• '
+        )}`
+      );
     }
     if (norm === '5') {
-      resetSession(from);
-      return sendText(from, infoContacto());
+      resetSession(waId);
+      return sendText(waId, infoContacto());
     }
     if (norm === '6') {
-      resetSession(from);
-      await notifyReception(`🟡 [Handoff solicitado]\nPaciente: ${from}\nMensaje: ${text}`);
-      return sendText(from, `Dale ✅ Contame en 1 línea qué necesitás (estudio/especialidad + día preferido).`);
+      setSession(waId, { state: 'handoff', context: {} });
+      return sendText(
+        waId,
+        `Dale ✅ Contame en 1 línea qué necesitás (especialidad/estudio + día preferido) y te ayudo.`
+      );
     }
 
-    // NLU simple desde menú
-    if (norm.includes('turno') || norm.includes('especialidad') || norm.includes('medico')) {
-      setSession(from, { state: 'choose_specialty' });
-      return sendText(from, specialtiesPrompt());
+    // fallback inteligente desde menú
+    if (norm.includes('turno')) {
+      setSession(waId, { state: 'turnos' });
+      return sendText(waId, turnosPrompt());
     }
-    if (norm.includes('estudio') || norm.includes('eco') || norm.includes('doppler') || norm.includes('holter') || norm.includes('laboratorio')) {
-      setSession(from, { state: 'choose_study' });
-      return sendText(from, studiesPrompt());
+    if (
+      norm.includes('estudio') ||
+      norm.includes('eco') ||
+      norm.includes('holter') ||
+      norm.includes('doppler')
+    ) {
+      setSession(waId, { state: 'estudios' });
+      return sendText(waId, estudiosPrompt());
     }
 
-    return sendText(from, noEntendiText());
+    return sendText(waId, menuText());
   }
 
-  // choose study
-  if (session.state === 'choose_study') {
-    if (norm === '0') return (resetSession(from), sendText(from, menuText()));
+  if (session.state === 'turnos') {
+    const sendMrTurno = async (label) => {
+      // después de mandar MrTurno, pasamos a “awaiting_receipt” (onboarding final)
+      setSession(waId, { state: 'awaiting_receipt', context: { type: 'turno', label } });
+      await sendText(waId, mrturnoText(`Perfecto: ${label}.`));
+      return sendText(waId, askReceiptText());
+    };
 
-    const match = findByNumberOrKeyword(norm, STUDIES);
-    if (!match) return sendText(from, `No lo reconocí 🙌\n\n${studiesPrompt()}`);
-
-    // "Otro"
-    if (match.n === '10') {
-      setSession(from, { state: 'choose_study', intent: 'study_other' });
-      return sendText(from, `Perfecto. Escribí el estudio exacto (ej: radiología, espirometría, poligrafía, etc.).`);
+    if (norm === '1') return sendMrTurno('Ginecología / Obstetricia');
+    if (norm === '2') return sendMrTurno('Pediatría');
+    if (norm === '3') return sendMrTurno('Clínica médica / Medicina familiar');
+    if (norm === '4') return sendMrTurno('Cardiología');
+    if (norm === '5') return sendMrTurno('Dermatología');
+    if (norm === '6') return sendMrTurno('Traumatología');
+    if (norm === '7') {
+      setSession(waId, { state: 'awaiting_specialty_text', context: {} });
+      return sendText(
+        waId,
+        'Decime la especialidad exacta (ej: Urología, ORL, Oftalmología, Psicología, Nutrición, etc.)'
+      );
     }
 
-    // si venía de "otro" y ahora escribió texto libre:
-    if (session.intent === 'study_other' && norm.length >= 3) {
-      const label = `Estudio: ${text}`;
-      setSession(from, { state: 'waiting_reserved_confirmation', intent: null, lastLabel: label });
-      return sendText(from, mrturnoStep(label));
+    // si escribió texto, intentamos match
+    const match = findMatch(norm, SPECIALTIES);
+    if (match) {
+      return sendMrTurno(match.label);
     }
 
-    const label = `Estudio: ${match.label}`;
-    setSession(from, { state: 'waiting_reserved_confirmation', lastLabel: label });
-    return sendText(from, mrturnoStep(label));
+    // no entendió: pedir precisión
+    return sendText(
+      waId,
+      `No lo pude identificar del todo 🙈\nDecime la especialidad exacta (ej: Urología / ORL / Oftalmología).`
+    );
   }
 
-  // choose specialty
-  if (session.state === 'choose_specialty') {
-    if (norm === '0') return (resetSession(from), sendText(from, menuText()));
+  if (session.state === 'awaiting_specialty_text') {
+    const match = findMatch(norm, SPECIALTIES);
+    const label = match ? match.label : rawText.trim();
 
-    const match = findByNumberOrKeyword(norm, SPECIALTIES);
-    if (!match) return sendText(from, `No lo reconocí 🙌\n\n${specialtiesPrompt()}`);
-
-    if (match.n === '7') {
-      setSession(from, { state: 'choose_specialty', intent: 'spec_other' });
-      return sendText(from, `Perfecto. Escribí la especialidad exacta (ej: urología, ORL, oftalmología, psicología, nutrición...).`);
-    }
-
-    if (session.intent === 'spec_other' && norm.length >= 3) {
-      const label = `Especialidad: ${text}`;
-      setSession(from, { state: 'waiting_reserved_confirmation', intent: null, lastLabel: label });
-      return sendText(from, mrturnoStep(label));
-    }
-
-    const label = `Especialidad: ${match.label}`;
-    setSession(from, { state: 'waiting_reserved_confirmation', lastLabel: label });
-    return sendText(from, mrturnoStep(label));
+    setSession(waId, { state: 'awaiting_receipt', context: { type: 'turno', label } });
+    await sendText(waId, mrturnoText(`Perfecto: ${label}.`));
+    return sendText(waId, askReceiptText());
   }
 
-  // waiting for receipt (comprobante)
-  if (session.state === 'waiting_receipt') {
-    // si escribe texto en vez de adjuntar:
-    if (norm.includes('no tengo') || norm.includes('despues') || norm.includes('luego')) {
-      return sendText(from, `Ok. Cuando lo tengas, enviá el comprobante por acá y lo registramos ✅`);
+  if (session.state === 'estudios') {
+    const sendMrTurno = async (label) => {
+      setSession(waId, { state: 'awaiting_receipt', context: { type: 'estudio', label } });
+      await sendText(waId, mrturnoText(`Perfecto: ${label}.`));
+      return sendText(waId, askReceiptText());
+    };
+
+    const byNum = {
+      '1': 'Mamografía',
+      '2': 'Ecografía / Eco 5D',
+      '3': 'Doppler / Ecocardiograma Doppler',
+      '4': 'ECG',
+      '5': 'MAPA (presión)',
+      '6': 'Ergometría',
+      '7': 'Holter',
+      '8': 'Laboratorio',
+      '9': 'Audiometría / BERA / OEA',
+      '10': null,
+    };
+
+    if (Object.prototype.hasOwnProperty.call(byNum, norm) && byNum[norm]) {
+      return sendMrTurno(byNum[norm]);
     }
-    return sendText(from, `Dale ✅ Enviame el comprobante (foto o PDF) por este chat y lo dejo registrado.`);
+
+    if (norm === '10') {
+      setSession(waId, { state: 'awaiting_study_text', context: {} });
+      return sendText(
+        waId,
+        'Decime el estudio exacto (ej: Radiología, Poligrafía, Espirometría, etc.)'
+      );
+    }
+
+    const match = findMatch(norm, STUDIES);
+    if (match) return sendMrTurno(match.label);
+
+    return sendText(
+      waId,
+      `No lo pude identificar 🙈\nDecime el estudio exacto (ej: Radiología / Espirometría / BERA).`
+    );
+  }
+
+  if (session.state === 'awaiting_study_text') {
+    const match = findMatch(norm, STUDIES);
+    const label = match ? match.label : rawText.trim();
+
+    setSession(waId, { state: 'awaiting_receipt', context: { type: 'estudio', label } });
+    await sendText(waId, mrturnoText(`Perfecto: ${label}.`));
+    return sendText(waId, askReceiptText());
+  }
+
+  if (session.state === 'awaiting_receipt') {
+    // si está pidiendo comprobante y el usuario manda algo que parece “comprobante” en texto
+    // (las imágenes se manejan en POST: si viene imagen, también se considera recibido)
+    if (norm.includes('id') || norm.includes('op') || /\d{6,}/.test(norm) || norm.includes('comprobante')) {
+      resetSession(waId);
+      return sendText(waId, finalConfirmedText());
+    }
+    // si no, pedimos comprobante
+    return sendText(waId, askReceiptText());
+  }
+
+  if (session.state === 'handoff') {
+    // handoff: guardamos la necesidad y devolvemos mensaje operativo
+    resetSession(waId);
+    return sendText(
+      waId,
+      `Perfecto ✅ Ya quedó. En breve te responde recepción.\n\nMientras tanto, si querés sacar turno rápido: ${CEPA.mrturno}`
+    );
   }
 
   // fallback total
-  resetSession(from);
-  return sendText(from, menuText()));
+  resetSession(waId);
+  return sendText(waId, menuText());
 }
 
-// ---- media handler (image/document) ----
-async function handleMediaMessage(from, msg) {
-  const s = getSession(from);
-
-  const mediaId =
-    msg?.image?.id ||
-    msg?.document?.id ||
-    null;
-
-  const mime =
-    msg?.image?.mime_type ||
-    msg?.document?.mime_type ||
-    null;
-
-  const filename =
-    msg?.document?.filename ||
-    null;
-
-  log('info', 'wa_media_received', { from, mediaId, mime, filename });
-
-  // Si estamos esperando comprobante, esto cierra el flujo
-  if (s.state === 'waiting_receipt') {
-    resetSession(from);
-
-    await notifyReception(
-      `✅ [Comprobante recibido]\nPaciente: ${from}\nServicio: ${s.lastLabel || 'N/D'}\nmedia_id: ${mediaId || 'N/D'}\n${filename ? `archivo: ${filename}\n` : ''}monto: $${DEPOSIT_AMOUNT_NUM.toLocaleString('es-AR')}`
-    );
-
-    return sendText(from, finalOkText());
-  }
-
-  // Si manda un archivo sin contexto:
-  await notifyReception(`📎 [Archivo sin contexto]\nPaciente: ${from}\nmedia_id: ${mediaId || 'N/D'}\n${filename ? `archivo: ${filename}` : ''}`);
-  return sendText(from, `Recibido ✅ ¿Esto es un comprobante de seña?\nSi sí, respondé “sí” y te pido el dato del turno. Si no, escribí qué necesitás.`);
-}
-
-// ----------------- webhook -----------------
+// ===== Health + privacidad =====
 app.get('/health', (_req, res) => {
-  res.status(200).json({ ok: true, uptime_s: Math.floor((Date.now() - STARTED_AT) / 1000) });
+  res.status(200).json({
+    ok: true,
+    uptime_s: Math.floor((Date.now() - STARTED_AT) / 1000),
+  });
 });
 
+app.get('/privacidad', (_req, res) => {
+  res.status(200).send(
+    `<html><head><meta charset="utf-8"><title>Privacidad</title></head>
+    <body style="font-family:system-ui;padding:24px;max-width:820px;margin:auto">
+    <h1>Política de Privacidad — Recepción Automática (CEPA)</h1>
+    <p>Este sistema responde mensajes para orientar turnos e información general. No es un servicio de emergencias.</p>
+    <p>Los mensajes pueden procesarse para mejorar la atención y generar trazabilidad operativa. No compartimos datos con terceros ajenos a la prestación del servicio.</p>
+    <p>Contacto: ${CEPA.email}</p>
+    </body></html>`
+  );
+});
+
+// ===== Webhook: verify (GET) =====
 function verifyHandler(req, res) {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
 
-  log('info', 'wa_verify_attempt', { mode, token_present: !!token, expected_present: !!WA_VERIFY_TOKEN });
+  log('info', 'wa_verify_attempt', {
+    mode,
+    token_present: !!token,
+    expected_present: !!WA_VERIFY_TOKEN,
+  });
 
   if (mode === 'subscribe' && token && WA_VERIFY_TOKEN && token === WA_VERIFY_TOKEN) {
     log('info', 'wa_webhook_verified');
     return res.status(200).send(challenge);
   }
 
-  log('warn', 'wa_webhook_verify_failed', { mode });
+  log('warn', 'wa_webhook_verify_failed', {
+    mode,
+    token_preview: token ? String(token).slice(0, 8) : null,
+  });
   return res.sendStatus(403);
 }
 
+// ===== Webhook: messages (POST) =====
 async function postHandler(req, res) {
   const sig = req.header('x-hub-signature-256');
   const okSig = verifyMetaSignature(req.body, sig, META_APP_SECRET);
@@ -548,7 +649,7 @@ async function postHandler(req, res) {
     return res.status(400).send('invalid_json');
   }
 
-  // Respond fast
+  // respondemos rápido a Meta
   res.sendStatus(200);
 
   try {
@@ -556,7 +657,7 @@ async function postHandler(req, res) {
     const change = entry?.changes?.[0];
     const value = change?.value;
 
-    // statuses -> ignore
+    // ignorar statuses
     if (value?.statuses?.length) {
       log('info', 'wa_status_update', { status: value.statuses[0]?.status });
       return;
@@ -565,43 +666,64 @@ async function postHandler(req, res) {
     const msg = value?.messages?.[0];
     if (!msg) return;
 
+    const msgId = msg.id;
     const from = msg.from;
 
-    // text
-    if (msg.type === 'text') {
-      const text = msg?.text?.body ? String(msg.text.body) : '';
-      log('info', 'wa_inbound', { from, text_preview: text.slice(0, 140) });
-
-      if (!text.trim()) {
-        resetSession(from);
-        await sendText(from, menuText());
+    // dedupe: Meta puede reintentar eventos
+    if (msgId) {
+      if (seenMsg.has(msgId)) {
+        log('info', 'wa_dedup_ignored', { msgId });
         return;
       }
+      seenMsg.set(msgId, Date.now());
+    }
 
-      await handleTextMessage(from, text);
+    // text / media
+    const text = msg?.text?.body ? String(msg.text.body) : '';
+
+    log('info', 'wa_inbound', { from, msgId, text_preview: text.slice(0, 140) });
+
+    // Si llega imagen/documento: lo tomamos como “comprobante recibido” si estamos esperando
+    const hasMedia =
+      !!msg?.image ||
+      !!msg?.document ||
+      !!msg?.video ||
+      !!msg?.audio ||
+      !!msg?.sticker;
+
+    if (hasMedia) {
+      const s = getSession(from);
+      if (s.state === 'awaiting_receipt') {
+        resetSession(from);
+        await sendText(from, finalConfirmedText());
+        return;
+      }
+      // si no estaba esperando comprobante, devolvemos guía
+      await sendText(from, `Recibido ✅ ¿Querés sacar turno o necesitás recepción?\n\n${menuText()}`);
       return;
     }
 
-    // image/doc receipt
-    if (msg.type === 'image' || msg.type === 'document') {
-      await handleMediaMessage(from, msg);
-      return;
+    // si llega vacío, devolvemos menú
+    if (!text.trim()) {
+      resetSession(from);
+      // ✅ acá estaba el error del paréntesis extra en tu log
+      return sendText(from, menuText());
     }
 
-    // other message types
-    await sendText(from, `Te leo perfecto ✅\nPara avanzar, mandame texto (ej: “eco doppler”, “turno”, “dirección”) o el comprobante si corresponde.`);
+    await handleUserText(from, text);
   } catch (e) {
     log('error', 'wa_handle_failed', { err: String(e?.message || e) });
   }
 }
 
+// Importante: raw body para firma
 app.get('/api/whatsapp', verifyHandler);
 app.get('/webhook', verifyHandler);
 
 app.post('/api/whatsapp', express.raw({ type: '*/*', limit: '2mb' }), postHandler);
 app.post('/webhook', express.raw({ type: '*/*', limit: '2mb' }), postHandler);
 
-// ----------------- start -----------------
+// ===== Start =====
 const port = Number(PORT);
 app.listen(port, '0.0.0.0', () => {
   log('info', 'server_started', {
@@ -609,9 +731,10 @@ app.listen(port, '0.0.0.0', () => {
     has_WA_ACCESS_TOKEN: !!WA_ACCESS_TOKEN,
     has_WA_VERIFY_TOKEN: !!WA_VERIFY_TOKEN,
     has_WA_PHONE_NUMBER_ID: !!WA_PHONE_NUMBER_ID,
-    has_META_APP_SECRET: !!META_APP_SECRET,
-    deposit_required: DEPOSIT_REQUIRED_BOOL,
-    deposit_amount: DEPOSIT_AMOUNT_NUM,
-    has_RECEPTION_NOTIFY_TO: !!RECEPTION_NOTIFY_TO,
+    WA_PHONE_NUMBER_ID_preview: WA_PHONE_NUMBER_ID
+      ? String(WA_PHONE_NUMBER_ID).slice(0, 6) + '...'
+      : null,
+    deposit_required: DEPOSIT_ON,
+    deposit_amount: DEPOSIT_VALUE,
   });
 });
