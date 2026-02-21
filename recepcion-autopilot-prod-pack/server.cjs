@@ -6,10 +6,12 @@
  * - Respuestas: text-only (robusto). Fase 2: interactive buttons/lists.
  *
  * Fixes incluidos:
- * ✅ SyntaxError extra ')'
  * ✅ express-rate-limit trust proxy warning (trust proxy = 1)
  * ✅ Limpieza sesiones (TTL)
  * ✅ Dedupe básico por msg.id (evita doble respuesta por retries)
+ * ✅ Firma X-Hub-Signature-256 (si hay META_APP_SECRET)
+ * ✅ Política seña (NO reintegrable, transferible 24h)
+ * ✅ Reminder automático si no envía comprobante (ventana de pago)
  */
 
 const express = require('express');
@@ -48,6 +50,9 @@ const {
   // Seña / anti no-show (fácil de cambiar por env)
   DEPOSIT_REQUIRED = 'true',
   DEPOSIT_AMOUNT = '10000',
+
+  // Ventana de pago (ms) y recordatorio
+  PAYMENT_WINDOW_MINUTES = '60', // 60 min por default
 } = process.env;
 
 const STARTED_AT = Date.now();
@@ -135,6 +140,12 @@ const DEPOSIT_VALUE = (() => {
   return Number.isFinite(n) && n > 0 ? n : 10000;
 })();
 
+const PAYMENT_WINDOW_MS = (() => {
+  const mins = Number(String(PAYMENT_WINDOW_MINUTES || '60').replace(/[^\d]/g, ''));
+  const safe = Number.isFinite(mins) && mins > 0 ? mins : 60;
+  return safe * 60 * 1000;
+})();
+
 function moneyARS(n) {
   try {
     return new Intl.NumberFormat('es-AR').format(n);
@@ -153,6 +164,14 @@ const CEPA = {
   mrturno: 'https://www.mrturno.com/m/@cepa',
   disclaimer:
     'Si es una urgencia, no uses este chat: llamá al 107 o acudí a guardia.',
+};
+
+// Política de seña (Retamales/CEPA)
+const DEPOSIT_POLICY = {
+  refundable: false,
+  transferable_hours: 24,
+  copy_short: (amount) =>
+    `Seña para confirmar: $${moneyARS(amount)}. No reintegrable. Transferible si reprogramás con ${DEPOSIT_POLICY.transferable_hours} hs de anticipación.`,
 };
 
 const SPECIALTIES = [
@@ -204,7 +223,16 @@ const OBRAS_SOCIALES_TOP = [
 ];
 
 // ===== Sessions + dedupe =====
-const sessions = new Map(); // wa_id -> { state, context, updatedAt }
+/**
+ * sessions: wa_id -> { state, context, updatedAt }
+ * context incluye:
+ *  - type: 'turno'|'estudio'
+ *  - label: string
+ *  - awaitingSince: timestamp cuando se pidió comprobante
+ *  - reminderSent: boolean
+ *  - reminderTimer: Timeout (no serializable, pero ok in-memory)
+ */
+const sessions = new Map();
 const SESSION_TTL_MS = 60 * 60 * 1000; // 1h
 
 const seenMsg = new Map(); // msgId -> ts
@@ -214,7 +242,11 @@ function gc() {
   const now = Date.now();
 
   for (const [k, s] of sessions.entries()) {
-    if (!s?.updatedAt || now - s.updatedAt > SESSION_TTL_MS) sessions.delete(k);
+    if (!s?.updatedAt || now - s.updatedAt > SESSION_TTL_MS) {
+      // si hay timer, lo limpiamos
+      try { if (s?.context?.reminderTimer) clearTimeout(s.context.reminderTimer); } catch {}
+      sessions.delete(k);
+    }
   }
 
   for (const [id, ts] of seenMsg.entries()) {
@@ -235,6 +267,8 @@ function setSession(waId, patch) {
 }
 
 function resetSession(waId) {
+  const cur = sessions.get(waId);
+  try { if (cur?.context?.reminderTimer) clearTimeout(cur.context.reminderTimer); } catch {}
   sessions.set(waId, { state: 'menu', context: {}, updatedAt: Date.now() });
 }
 
@@ -243,6 +277,45 @@ function findMatch(norm, list) {
     if (item.kw.some((k) => norm.includes(k))) return item;
   }
   return null;
+}
+
+// ===== Payment reminder scheduling =====
+function schedulePaymentReminder(waId) {
+  if (!DEPOSIT_ON) return;
+
+  const s = getSession(waId);
+  if (s.state !== 'awaiting_receipt') return;
+
+  // si ya existe timer, no duplicamos
+  if (s?.context?.reminderTimer) return;
+
+  const createdAt = Date.now();
+  const timer = setTimeout(async () => {
+    try {
+      const cur = getSession(waId);
+      if (cur.state !== 'awaiting_receipt') return; // ya resolvió
+      if (cur.context?.reminderSent) return;
+
+      // marcamos como enviado
+      setSession(waId, {
+        state: 'awaiting_receipt',
+        context: { ...cur.context, reminderSent: true },
+      });
+
+      await sendText(
+        waId,
+        `Recordatorio ✅ Para confirmar el turno necesitamos la seña de $${moneyARS(DEPOSIT_VALUE)}.\n${DEPOSIT_POLICY.copy_short(DEPOSIT_VALUE)}\n\nSi ya la abonaste, enviá el comprobante (captura o ID de operación).`
+      );
+    } catch (e) {
+      log('error', 'payment_reminder_failed', { err: String(e?.message || e) });
+    }
+  }, PAYMENT_WINDOW_MS);
+
+  // guardamos timer + timestamp
+  setSession(waId, {
+    state: 'awaiting_receipt',
+    context: { ...s.context, awaitingSince: createdAt, reminderTimer: timer, reminderSent: false },
+  });
 }
 
 // ===== UX copy (premium) =====
@@ -312,29 +385,30 @@ function infoContacto() {
 
 function mrturnoText(extraLine) {
   const depositLine = DEPOSIT_ON
-    ? `\n\n✅ Para confirmar el turno: seña de $${moneyARS(DEPOSIT_VALUE)} (anti no-show).`
+    ? `\n\n✅ ${DEPOSIT_POLICY.copy_short(DEPOSIT_VALUE)}`
     : '';
 
   return (
 `${extraLine ? extraLine + '\n\n' : ''}Para sacar turno rápido usá MrTurno:
 ${CEPA.mrturno}${depositLine}
 
-Si preferís, decime “recepción” y te ayudo por acá.`
+Cuando lo tengas reservado, escribime “LISTO” para confirmarlo por acá.`
   );
 }
 
 function askReceiptText() {
-  // “Onboarding” final: pedir comprobante simple si aplica
   if (!DEPOSIT_ON) {
     return (
-`Listo ✅ Cuando tengas el turno confirmado, escribime “listo” y te dejo la info final (dirección/horarios).`
+`Listo ✅ Cuando tengas el turno confirmado, escribime “LISTO” y te dejo la info final (dirección/horarios).`
     );
   }
 
   return (
-`Perfecto ✅ Para dejarlo confirmado: enviame el comprobante de seña de $${moneyARS(DEPOSIT_VALUE)}.
+`Perfecto ✅ Para confirmar el turno necesitamos la seña de $${moneyARS(DEPOSIT_VALUE)}.
 
-📌 Podés mandar:
+${DEPOSIT_POLICY.copy_short(DEPOSIT_VALUE)}
+
+📌 Enviame:
 • Captura del comprobante (imagen) o
 • El número/ID de operación en texto
 
@@ -344,15 +418,15 @@ Apenas lo reciba, te dejo el mensaje final con todos los datos.`
 
 function finalConfirmedText() {
   const depositLine = DEPOSIT_ON
-    ? `\n✅ Seña anti no-show: $${moneyARS(DEPOSIT_VALUE)} (recibida).`
+    ? `\n✅ Seña recibida: $${moneyARS(DEPOSIT_VALUE)}.`
     : '';
 
   return (
-`Listo ✅ Turno en proceso de confirmación.
+`Listo ✅ Turno confirmado.
 
 ${infoContacto()}${depositLine}
 
-Si necesitás cambiar o cancelar, respondé “recepción”.`
+Si necesitás reprogramar, escribí “recepción”.`
   );
 }
 
@@ -385,7 +459,6 @@ async function handleUserText(waId, rawText) {
   }
 
   if (norm.includes('recep') || norm.includes('humano') || norm.includes('persona')) {
-    // fase 1: handoff
     setSession(waId, { state: 'handoff', context: {} });
     return sendText(
       waId,
@@ -393,20 +466,15 @@ async function handleUserText(waId, rawText) {
     );
   }
 
-  // Si el usuario dice "listo" => onboarding final (pide comprobante / entrega cierre)
+  // “LISTO” => onboarding final
   if (norm === 'listo' || norm === 'ok' || norm === 'dale' || norm === 'ya') {
-    // si veníamos de mrturno => pedir comprobante
     if (session.state === 'awaiting_receipt') {
-      // si todavía no mandó comprobante, insistimos amable
+      schedulePaymentReminder(waId); // asegura reminder si no lo tenía
       return sendText(waId, askReceiptText());
     }
 
-    // si estaba en cualquier otro lado, devolvemos menú (pero mejor: guiar)
     resetSession(waId);
-    return sendText(
-      waId,
-      `Perfecto. ¿En qué te ayudo?\n\n${menuText()}`
-    );
+    return sendText(waId, `Perfecto. ¿En qué te ayudo?\n\n${menuText()}`);
   }
 
   // state machine
@@ -423,18 +491,14 @@ async function handleUserText(waId, rawText) {
       resetSession(waId);
       return sendText(
         waId,
-        `Estética (algunos tratamientos):\n• ${ESTETICA.join(
-          '\n• '
-        )}\n\n¿Querés turno? Respondé “turno” y te paso MrTurno.`
+        `Estética (algunos tratamientos):\n• ${ESTETICA.join('\n• ')}\n\n¿Querés turno? Respondé “turno” y te paso MrTurno.`
       );
     }
     if (norm === '4') {
       resetSession(waId);
       return sendText(
         waId,
-        `Obras sociales/prepagas: decime cuál tenés y te confirmo.\nAlgunas frecuentes:\n• ${OBRAS_SOCIALES_TOP.join(
-          '\n• '
-        )}`
+        `Obras sociales/prepagas: decime cuál tenés y te confirmo.\nAlgunas frecuentes:\n• ${OBRAS_SOCIALES_TOP.join('\n• ')}`
       );
     }
     if (norm === '5') {
@@ -449,17 +513,12 @@ async function handleUserText(waId, rawText) {
       );
     }
 
-    // fallback inteligente desde menú
+    // fallback inteligente
     if (norm.includes('turno')) {
       setSession(waId, { state: 'turnos' });
       return sendText(waId, turnosPrompt());
     }
-    if (
-      norm.includes('estudio') ||
-      norm.includes('eco') ||
-      norm.includes('holter') ||
-      norm.includes('doppler')
-    ) {
+    if (norm.includes('estudio') || norm.includes('eco') || norm.includes('holter') || norm.includes('doppler')) {
       setSession(waId, { state: 'estudios' });
       return sendText(waId, estudiosPrompt());
     }
@@ -469,10 +528,12 @@ async function handleUserText(waId, rawText) {
 
   if (session.state === 'turnos') {
     const sendMrTurno = async (label) => {
-      // después de mandar MrTurno, pasamos a “awaiting_receipt” (onboarding final)
+      // pasamos a awaiting_receipt y programamos recordatorio
       setSession(waId, { state: 'awaiting_receipt', context: { type: 'turno', label } });
       await sendText(waId, mrturnoText(`Perfecto: ${label}.`));
-      return sendText(waId, askReceiptText());
+      await sendText(waId, askReceiptText());
+      schedulePaymentReminder(waId);
+      return;
     };
 
     if (norm === '1') return sendMrTurno('Ginecología / Obstetricia');
@@ -483,23 +544,13 @@ async function handleUserText(waId, rawText) {
     if (norm === '6') return sendMrTurno('Traumatología');
     if (norm === '7') {
       setSession(waId, { state: 'awaiting_specialty_text', context: {} });
-      return sendText(
-        waId,
-        'Decime la especialidad exacta (ej: Urología, ORL, Oftalmología, Psicología, Nutrición, etc.)'
-      );
+      return sendText(waId, 'Decime la especialidad exacta (ej: Urología, ORL, Oftalmología, Psicología, Nutrición, etc.)');
     }
 
-    // si escribió texto, intentamos match
     const match = findMatch(norm, SPECIALTIES);
-    if (match) {
-      return sendMrTurno(match.label);
-    }
+    if (match) return sendMrTurno(match.label);
 
-    // no entendió: pedir precisión
-    return sendText(
-      waId,
-      `No lo pude identificar del todo 🙈\nDecime la especialidad exacta (ej: Urología / ORL / Oftalmología).`
-    );
+    return sendText(waId, `No lo pude identificar del todo 🙈\nDecime la especialidad exacta (ej: Urología / ORL / Oftalmología).`);
   }
 
   if (session.state === 'awaiting_specialty_text') {
@@ -508,14 +559,18 @@ async function handleUserText(waId, rawText) {
 
     setSession(waId, { state: 'awaiting_receipt', context: { type: 'turno', label } });
     await sendText(waId, mrturnoText(`Perfecto: ${label}.`));
-    return sendText(waId, askReceiptText());
+    await sendText(waId, askReceiptText());
+    schedulePaymentReminder(waId);
+    return;
   }
 
   if (session.state === 'estudios') {
     const sendMrTurno = async (label) => {
       setSession(waId, { state: 'awaiting_receipt', context: { type: 'estudio', label } });
       await sendText(waId, mrturnoText(`Perfecto: ${label}.`));
-      return sendText(waId, askReceiptText());
+      await sendText(waId, askReceiptText());
+      schedulePaymentReminder(waId);
+      return;
     };
 
     const byNum = {
@@ -537,19 +592,13 @@ async function handleUserText(waId, rawText) {
 
     if (norm === '10') {
       setSession(waId, { state: 'awaiting_study_text', context: {} });
-      return sendText(
-        waId,
-        'Decime el estudio exacto (ej: Radiología, Poligrafía, Espirometría, etc.)'
-      );
+      return sendText(waId, 'Decime el estudio exacto (ej: Radiología, Poligrafía, Espirometría, etc.)');
     }
 
     const match = findMatch(norm, STUDIES);
     if (match) return sendMrTurno(match.label);
 
-    return sendText(
-      waId,
-      `No lo pude identificar 🙈\nDecime el estudio exacto (ej: Radiología / Espirometría / BERA).`
-    );
+    return sendText(waId, `No lo pude identificar 🙈\nDecime el estudio exacto (ej: Radiología / Espirometría / BERA).`);
   }
 
   if (session.state === 'awaiting_study_text') {
@@ -558,22 +607,23 @@ async function handleUserText(waId, rawText) {
 
     setSession(waId, { state: 'awaiting_receipt', context: { type: 'estudio', label } });
     await sendText(waId, mrturnoText(`Perfecto: ${label}.`));
-    return sendText(waId, askReceiptText());
+    await sendText(waId, askReceiptText());
+    schedulePaymentReminder(waId);
+    return;
   }
 
   if (session.state === 'awaiting_receipt') {
-    // si está pidiendo comprobante y el usuario manda algo que parece “comprobante” en texto
-    // (las imágenes se manejan en POST: si viene imagen, también se considera recibido)
-    if (norm.includes('id') || norm.includes('op') || /\d{6,}/.test(norm) || norm.includes('comprobante')) {
+    // si manda algo que parece comprobante (texto)
+    if (norm.includes('id') || norm.includes('op') || /\d{6,}/.test(norm) || norm.includes('comprobante') || norm.includes('transfer')) {
       resetSession(waId);
       return sendText(waId, finalConfirmedText());
     }
-    // si no, pedimos comprobante
+    // si no, repetimos la instrucción
+    schedulePaymentReminder(waId);
     return sendText(waId, askReceiptText());
   }
 
   if (session.state === 'handoff') {
-    // handoff: guardamos la necesidad y devolvemos mensaje operativo
     resetSession(waId);
     return sendText(
       waId,
@@ -581,7 +631,6 @@ async function handleUserText(waId, rawText) {
     );
   }
 
-  // fallback total
   resetSession(waId);
   return sendText(waId, menuText());
 }
@@ -678,12 +727,10 @@ async function postHandler(req, res) {
       seenMsg.set(msgId, Date.now());
     }
 
-    // text / media
     const text = msg?.text?.body ? String(msg.text.body) : '';
-
     log('info', 'wa_inbound', { from, msgId, text_preview: text.slice(0, 140) });
 
-    // Si llega imagen/documento: lo tomamos como “comprobante recibido” si estamos esperando
+    // media: si estamos esperando comprobante => confirmado
     const hasMedia =
       !!msg?.image ||
       !!msg?.document ||
@@ -698,15 +745,12 @@ async function postHandler(req, res) {
         await sendText(from, finalConfirmedText());
         return;
       }
-      // si no estaba esperando comprobante, devolvemos guía
       await sendText(from, `Recibido ✅ ¿Querés sacar turno o necesitás recepción?\n\n${menuText()}`);
       return;
     }
 
-    // si llega vacío, devolvemos menú
     if (!text.trim()) {
       resetSession(from);
-      // ✅ acá estaba el error del paréntesis extra en tu log
       return sendText(from, menuText());
     }
 
@@ -731,10 +775,9 @@ app.listen(port, '0.0.0.0', () => {
     has_WA_ACCESS_TOKEN: !!WA_ACCESS_TOKEN,
     has_WA_VERIFY_TOKEN: !!WA_VERIFY_TOKEN,
     has_WA_PHONE_NUMBER_ID: !!WA_PHONE_NUMBER_ID,
-    WA_PHONE_NUMBER_ID_preview: WA_PHONE_NUMBER_ID
-      ? String(WA_PHONE_NUMBER_ID).slice(0, 6) + '...'
-      : null,
+    WA_PHONE_NUMBER_ID_preview: WA_PHONE_NUMBER_ID ? String(WA_PHONE_NUMBER_ID).slice(0, 6) + '...' : null,
     deposit_required: DEPOSIT_ON,
     deposit_amount: DEPOSIT_VALUE,
+    payment_window_minutes: Math.round(PAYMENT_WINDOW_MS / 60000),
   });
 });
