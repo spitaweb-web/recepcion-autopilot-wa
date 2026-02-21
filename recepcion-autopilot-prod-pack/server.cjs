@@ -12,6 +12,12 @@
  * ✅ Firma X-Hub-Signature-256 (si hay META_APP_SECRET)
  * ✅ Política seña (NO reintegrable, transferible 24h)
  * ✅ Reminder automático si no envía comprobante (ventana de pago)
+ *
+ * Capa “natural” agregada:
+ * ✅ Saludos (hola/buen día) → 3 variantes random
+ * ✅ Cierre (gracias/chau) → 3 variantes random
+ * ✅ Registro de operación/comprobante con ID interno (pilot-grade)
+ * ✅ Respuesta “multicanal” (orienta: MrTurno / Recepción / Menú)
  */
 
 const express = require('express');
@@ -21,11 +27,6 @@ const crypto = require('crypto');
 
 const app = express();
 app.disable('x-powered-by');
-
-/**
- * Render suele estar detrás de 1 proxy (ELB/Reverse proxy).
- * NO uses true: es “permissive” y rate-limit se queja.
- */
 app.set('trust proxy', 1);
 
 app.use(helmet());
@@ -35,7 +36,7 @@ app.use(
     max: 240,
     standardHeaders: true,
     legacyHeaders: false,
-    keyGenerator: (req) => req.ip, // estable
+    keyGenerator: (req) => req.ip,
   })
 );
 
@@ -44,15 +45,16 @@ const {
   WA_VERIFY_TOKEN,
   WA_ACCESS_TOKEN,
   WA_PHONE_NUMBER_ID,
-  META_APP_SECRET, // recomendado: valida X-Hub-Signature-256
+  META_APP_SECRET,
   GRAPH_VERSION = 'v22.0',
 
-  // Seña / anti no-show (fácil de cambiar por env)
   DEPOSIT_REQUIRED = 'true',
   DEPOSIT_AMOUNT = '10000',
 
-  // Ventana de pago (ms) y recordatorio
-  PAYMENT_WINDOW_MINUTES = '60', // 60 min por default
+  PAYMENT_WINDOW_MINUTES = '60',
+
+  // opcional para “multicanal real” a futuro:
+  // LEADS_WEBHOOK_URL, // por ej. endpoint tuyo / notion automation
 } = process.env;
 
 const STARTED_AT = Date.now();
@@ -76,11 +78,11 @@ function normalize(s) {
     .trim()
     .toLowerCase()
     .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, ''); // sin tildes
+    .replace(/[\u0300-\u036f]/g, '');
 }
 
 function verifyMetaSignature(rawBodyBuffer, signatureHeader, appSecret) {
-  if (!appSecret) return true; // si no hay secret, no bloqueamos (pero logueamos)
+  if (!appSecret) return true;
   if (!signatureHeader || typeof signatureHeader !== 'string') return false;
   if (!signatureHeader.startsWith('sha256=')) return false;
 
@@ -89,6 +91,17 @@ function verifyMetaSignature(rawBodyBuffer, signatureHeader, appSecret) {
     crypto.createHmac('sha256', appSecret).update(rawBodyBuffer).digest('hex');
 
   return timingSafeEq(ours, signatureHeader);
+}
+
+function randPick(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function makeReceiptId(prefix = 'CEPA') {
+  // corto, legible, unique-ish
+  const ts = Date.now().toString(36).toUpperCase();
+  const r = crypto.randomBytes(3).toString('hex').toUpperCase();
+  return `${prefix}-${ts}-${r}`;
 }
 
 async function sendText(toWaId, text) {
@@ -119,18 +132,13 @@ async function sendText(toWaId, text) {
 
   if (!resp.ok) {
     let j = {};
-    try {
-      j = await resp.json();
-    } catch {}
+    try { j = await resp.json(); } catch {}
     log('error', 'wa_outbound_failed', { status: resp.status, err: j });
     return { ok: false, status: resp.status, err: j };
   }
 
   const data = await resp.json();
-  log('info', 'wa_outbound_sent', {
-    to: toWaId,
-    msg_id: data?.messages?.[0]?.id,
-  });
+  log('info', 'wa_outbound_sent', { to: toWaId, msg_id: data?.messages?.[0]?.id });
   return { ok: true, data };
 }
 
@@ -147,11 +155,8 @@ const PAYMENT_WINDOW_MS = (() => {
 })();
 
 function moneyARS(n) {
-  try {
-    return new Intl.NumberFormat('es-AR').format(n);
-  } catch {
-    return String(n);
-  }
+  try { return new Intl.NumberFormat('es-AR').format(n); }
+  catch { return String(n); }
 }
 
 // ===== CEPA Data =====
@@ -162,11 +167,9 @@ const CEPA = {
   email: 'cepadiagnosticomedicointegral@gmail.com',
   phone: '261-4987007',
   mrturno: 'https://www.mrturno.com/m/@cepa',
-  disclaimer:
-    'Si es una urgencia, no uses este chat: llamá al 107 o acudí a guardia.',
+  disclaimer: 'Si es una urgencia, no uses este chat: llamá al 107 o acudí a guardia.',
 };
 
-// Política de seña (Retamales/CEPA)
 const DEPOSIT_POLICY = {
   refundable: false,
   transferable_hours: 24,
@@ -222,28 +225,45 @@ const OBRAS_SOCIALES_TOP = [
   'Jerárquicos Salud', 'Andes Salud', 'Nobis', 'Federada Salud', 'Medicus'
 ];
 
+// ===== Natural layer triggers =====
+const GREETINGS = ['hola', 'holaa', 'buen dia', 'buen día', 'buenas', 'buenas tardes', 'buenas noches', 'hey', 'que tal', 'qué tal'];
+const THANKS = ['gracias', 'muchas gracias', 'mil gracias', 'genial gracias', 'graciass'];
+const BYE = ['chau', 'chao', 'hasta luego', 'nos vemos', 'adios', 'adiós', 'bye'];
+
+const GREETING_REPLIES = [
+  `¡Hola! 👋 Soy la recepción automática de ${CEPA.name}.\nDecime qué necesitás o respondé con un número:\n\n1) Sacar turno\n2) Estudios\n3) Estética\n4) Obras sociales\n5) Dirección/horarios\n6) Recepción`,
+  `¡Buenas! 👋 Estoy para ayudarte rápido.\nRespondé:\n1) Turno\n2) Estudios\n3) Estética\n4) Obras sociales\n5) Dirección/horarios\n6) Recepción`,
+  `Hola 👋 Bienvenido/a a ${CEPA.name}.\n¿Querés turno o info? (Respondé con número)\n1) Turno · 2) Estudios · 3) Estética · 4) Obras sociales · 5) Dirección/horarios · 6) Recepción`,
+];
+
+const CLOSING_REPLIES = [
+  `¡De nada! ✅ Si necesitás algo más, escribí “menú”.`,
+  `Perfecto 🙌 Cualquier cosa, escribime “menú” y te ayudo.`,
+  `Listo ✅ Te leo cuando quieras. (Escribí “menú” para ver opciones)`,
+];
+
 // ===== Sessions + dedupe =====
 /**
  * sessions: wa_id -> { state, context, updatedAt }
- * context incluye:
- *  - type: 'turno'|'estudio'
- *  - label: string
- *  - awaitingSince: timestamp cuando se pidió comprobante
- *  - reminderSent: boolean
- *  - reminderTimer: Timeout (no serializable, pero ok in-memory)
+ * context:
+ *  - type, label
+ *  - awaitingSince, reminderSent, reminderTimer
+ *  - lastReceiptId (último comprobante)
  */
 const sessions = new Map();
-const SESSION_TTL_MS = 60 * 60 * 1000; // 1h
+const SESSION_TTL_MS = 60 * 60 * 1000;
 
-const seenMsg = new Map(); // msgId -> ts
-const SEEN_TTL_MS = 10 * 60 * 1000; // 10m
+const seenMsg = new Map();
+const SEEN_TTL_MS = 10 * 60 * 1000;
+
+// Registro in-memory del piloto (para mostrar “trazabilidad”)
+const receiptsLog = new Map(); // receiptId -> { waId, at, kind, rawHint }
 
 function gc() {
   const now = Date.now();
 
   for (const [k, s] of sessions.entries()) {
     if (!s?.updatedAt || now - s.updatedAt > SESSION_TTL_MS) {
-      // si hay timer, lo limpiamos
       try { if (s?.context?.reminderTimer) clearTimeout(s.context.reminderTimer); } catch {}
       sessions.delete(k);
     }
@@ -251,6 +271,12 @@ function gc() {
 
   for (const [id, ts] of seenMsg.entries()) {
     if (!ts || now - ts > SEEN_TTL_MS) seenMsg.delete(id);
+  }
+
+  // receiptsLog: lo dejamos 48h
+  const RECEIPT_TTL = 48 * 60 * 60 * 1000;
+  for (const [rid, r] of receiptsLog.entries()) {
+    if (!r?.at || now - r.at > RECEIPT_TTL) receiptsLog.delete(rid);
   }
 }
 setInterval(gc, 60 * 1000).unref();
@@ -285,18 +311,15 @@ function schedulePaymentReminder(waId) {
 
   const s = getSession(waId);
   if (s.state !== 'awaiting_receipt') return;
-
-  // si ya existe timer, no duplicamos
   if (s?.context?.reminderTimer) return;
 
   const createdAt = Date.now();
   const timer = setTimeout(async () => {
     try {
       const cur = getSession(waId);
-      if (cur.state !== 'awaiting_receipt') return; // ya resolvió
+      if (cur.state !== 'awaiting_receipt') return;
       if (cur.context?.reminderSent) return;
 
-      // marcamos como enviado
       setSession(waId, {
         state: 'awaiting_receipt',
         context: { ...cur.context, reminderSent: true },
@@ -311,14 +334,13 @@ function schedulePaymentReminder(waId) {
     }
   }, PAYMENT_WINDOW_MS);
 
-  // guardamos timer + timestamp
   setSession(waId, {
     state: 'awaiting_receipt',
     context: { ...s.context, awaitingSince: createdAt, reminderTimer: timer, reminderSent: false },
   });
 }
 
-// ===== UX copy (premium) =====
+// ===== UX copy =====
 function menuText() {
   return (
 `Hola 👋 Soy la recepción automática de ${CEPA.name}.
@@ -384,10 +406,7 @@ function infoContacto() {
 }
 
 function mrturnoText(extraLine) {
-  const depositLine = DEPOSIT_ON
-    ? `\n\n✅ ${DEPOSIT_POLICY.copy_short(DEPOSIT_VALUE)}`
-    : '';
-
+  const depositLine = DEPOSIT_ON ? `\n\n✅ ${DEPOSIT_POLICY.copy_short(DEPOSIT_VALUE)}` : '';
   return (
 `${extraLine ? extraLine + '\n\n' : ''}Para sacar turno rápido usá MrTurno:
 ${CEPA.mrturno}${depositLine}
@@ -398,11 +417,8 @@ Cuando lo tengas reservado, escribime “LISTO” para confirmarlo por acá.`
 
 function askReceiptText() {
   if (!DEPOSIT_ON) {
-    return (
-`Listo ✅ Cuando tengas el turno confirmado, escribime “LISTO” y te dejo la info final (dirección/horarios).`
-    );
+    return `Listo ✅ Cuando tengas el turno confirmado, escribime “LISTO” y te dejo la info final (dirección/horarios).`;
   }
-
   return (
 `Perfecto ✅ Para confirmar el turno necesitamos la seña de $${moneyARS(DEPOSIT_VALUE)}.
 
@@ -412,17 +428,15 @@ ${DEPOSIT_POLICY.copy_short(DEPOSIT_VALUE)}
 • Captura del comprobante (imagen) o
 • El número/ID de operación en texto
 
-Apenas lo reciba, te dejo el mensaje final con todos los datos.`
+Apenas lo reciba, te genero un comprobante con ID y queda confirmado.`
   );
 }
 
-function finalConfirmedText() {
-  const depositLine = DEPOSIT_ON
-    ? `\n✅ Seña recibida: $${moneyARS(DEPOSIT_VALUE)}.`
-    : '';
-
+function finalConfirmedText(receiptId) {
+  const depositLine = DEPOSIT_ON ? `\n✅ Seña registrada: $${moneyARS(DEPOSIT_VALUE)}.` : '';
+  const receiptLine = receiptId ? `\n🧾 Comprobante: ${receiptId}` : '';
   return (
-`Listo ✅ Turno confirmado.
+`Listo ✅ Turno confirmado.${receiptLine}
 
 ${infoContacto()}${depositLine}
 
@@ -430,17 +444,69 @@ Si necesitás reprogramar, escribí “recepción”.`
   );
 }
 
+function receiptAckText(receiptId) {
+  return (
+`Recibido ✅ Ya registré tu seña.
+
+🧾 Este es tu comprobante: ${receiptId}
+
+${DEPOSIT_POLICY.copy_short(DEPOSIT_VALUE)}`
+  );
+}
+
+// ===== Helpers: detect greetings/closing =====
+function isGreeting(norm) {
+  return GREETINGS.some((g) => norm === normalize(g) || norm.startsWith(normalize(g)));
+}
+function isThanksOrBye(norm) {
+  const hasThanks = THANKS.some((t) => norm === normalize(t) || norm.includes(normalize(t)));
+  const hasBye = BYE.some((b) => norm === normalize(b) || norm.includes(normalize(b)));
+  return hasThanks || hasBye;
+}
+
+// ===== Receipt registration =====
+function registerReceipt({ waId, kind, rawHint }) {
+  const receiptId = makeReceiptId('CEPA');
+  receiptsLog.set(receiptId, { waId, at: Date.now(), kind, rawHint: rawHint || null });
+
+  // guardamos en sesión también
+  const s = getSession(waId);
+  setSession(waId, { state: s.state, context: { ...s.context, lastReceiptId: receiptId } });
+
+  return receiptId;
+}
+
+function maybeLooksLikeReceiptText(norm) {
+  return (
+    norm.includes('comprobante') ||
+    norm.includes('transfer') ||
+    norm.includes('id') ||
+    norm.includes('op') ||
+    /\d{6,}/.test(norm)
+  );
+}
+
 // ===== Flow =====
 async function handleUserText(waId, rawText) {
   const norm = normalize(rawText);
+  const session = getSession(waId);
+
+  // capa natural: saludo
+  if (isGreeting(norm) && session.state === 'menu') {
+    return sendText(waId, randPick(GREETING_REPLIES));
+  }
+
+  // capa natural: cierre (gracias/chau)
+  if (isThanksOrBye(norm) && session.state !== 'awaiting_receipt') {
+    // si está esperando comprobante, no cortamos; lo guiamos
+    return sendText(waId, randPick(CLOSING_REPLIES));
+  }
 
   // comandos globales
   if (norm === '0' || norm === 'menu' || norm === 'inicio') {
     resetSession(waId);
     return sendText(waId, menuText());
   }
-
-  const session = getSession(waId);
 
   // accesos rápidos
   if (norm.includes('horario') || norm.includes('direccion') || norm.includes('ubic')) {
@@ -452,9 +518,7 @@ async function handleUserText(waId, rawText) {
     resetSession(waId);
     return sendText(
       waId,
-      `Trabajamos con varias obras sociales/prepagas. Algunas frecuentes:\n• ${OBRAS_SOCIALES_TOP.join(
-        '\n• '
-      )}\n\nSi me decís cuál tenés, te confirmo si está.`
+      `Trabajamos con varias obras sociales/prepagas. Algunas frecuentes:\n• ${OBRAS_SOCIALES_TOP.join('\n• ')}\n\nSi me decís cuál tenés, te confirmo si está.`
     );
   }
 
@@ -466,15 +530,24 @@ async function handleUserText(waId, rawText) {
     );
   }
 
-  // “LISTO” => onboarding final
+  // LISTO => pedir comprobante (si aplica)
   if (norm === 'listo' || norm === 'ok' || norm === 'dale' || norm === 'ya') {
+    // si veníamos de mrturno/awaiting, pedimos comprobante
     if (session.state === 'awaiting_receipt') {
-      schedulePaymentReminder(waId); // asegura reminder si no lo tenía
+      schedulePaymentReminder(waId);
       return sendText(waId, askReceiptText());
     }
-
     resetSession(waId);
     return sendText(waId, `Perfecto. ¿En qué te ayudo?\n\n${menuText()}`);
+  }
+
+  // Si está esperando comprobante y el usuario manda texto que parece comprobante:
+  if (session.state === 'awaiting_receipt' && maybeLooksLikeReceiptText(norm)) {
+    // registrar comprobante con ID interno
+    const receiptId = registerReceipt({ waId, kind: session.context?.type || 'unknown', rawHint: rawText.trim().slice(0, 120) });
+    resetSession(waId);
+    await sendText(waId, receiptAckText(receiptId));
+    return sendText(waId, finalConfirmedText(receiptId));
   }
 
   // state machine
@@ -528,7 +601,6 @@ async function handleUserText(waId, rawText) {
 
   if (session.state === 'turnos') {
     const sendMrTurno = async (label) => {
-      // pasamos a awaiting_receipt y programamos recordatorio
       setSession(waId, { state: 'awaiting_receipt', context: { type: 'turno', label } });
       await sendText(waId, mrturnoText(`Perfecto: ${label}.`));
       await sendText(waId, askReceiptText());
@@ -613,12 +685,7 @@ async function handleUserText(waId, rawText) {
   }
 
   if (session.state === 'awaiting_receipt') {
-    // si manda algo que parece comprobante (texto)
-    if (norm.includes('id') || norm.includes('op') || /\d{6,}/.test(norm) || norm.includes('comprobante') || norm.includes('transfer')) {
-      resetSession(waId);
-      return sendText(waId, finalConfirmedText());
-    }
-    // si no, repetimos la instrucción
+    // si no parece comprobante, insistimos + no cortamos con chau/gracias
     schedulePaymentReminder(waId);
     return sendText(waId, askReceiptText());
   }
@@ -698,7 +765,6 @@ async function postHandler(req, res) {
     return res.status(400).send('invalid_json');
   }
 
-  // respondemos rápido a Meta
   res.sendStatus(200);
 
   try {
@@ -706,7 +772,6 @@ async function postHandler(req, res) {
     const change = entry?.changes?.[0];
     const value = change?.value;
 
-    // ignorar statuses
     if (value?.statuses?.length) {
       log('info', 'wa_status_update', { status: value.statuses[0]?.status });
       return;
@@ -718,7 +783,6 @@ async function postHandler(req, res) {
     const msgId = msg.id;
     const from = msg.from;
 
-    // dedupe: Meta puede reintentar eventos
     if (msgId) {
       if (seenMsg.has(msgId)) {
         log('info', 'wa_dedup_ignored', { msgId });
@@ -730,7 +794,6 @@ async function postHandler(req, res) {
     const text = msg?.text?.body ? String(msg.text.body) : '';
     log('info', 'wa_inbound', { from, msgId, text_preview: text.slice(0, 140) });
 
-    // media: si estamos esperando comprobante => confirmado
     const hasMedia =
       !!msg?.image ||
       !!msg?.document ||
@@ -740,11 +803,16 @@ async function postHandler(req, res) {
 
     if (hasMedia) {
       const s = getSession(from);
+
+      // Si llega media y estamos esperando comprobante => registramos receipt + confirmamos
       if (s.state === 'awaiting_receipt') {
+        const receiptId = registerReceipt({ waId: from, kind: s.context?.type || 'unknown', rawHint: 'media' });
         resetSession(from);
-        await sendText(from, finalConfirmedText());
+        await sendText(from, receiptAckText(receiptId));
+        await sendText(from, finalConfirmedText(receiptId));
         return;
       }
+
       await sendText(from, `Recibido ✅ ¿Querés sacar turno o necesitás recepción?\n\n${menuText()}`);
       return;
     }
