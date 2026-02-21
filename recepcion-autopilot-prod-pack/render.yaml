@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: recepcion-autopilot-wa
+    env: node
+    rootDir: recepcion-autopilot-prod-pack
+    buildCommand: yarn
+    startCommand: yarn start
+    autoDeploy: true
