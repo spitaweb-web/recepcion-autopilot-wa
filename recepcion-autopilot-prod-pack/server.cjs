@@ -2,28 +2,21 @@
 
 /**
  * Recepción Autopilot — CEPA (WhatsApp Cloud API) — Node/Express
- * - Webhook verify + messages: /api/whatsapp (y alias /webhook)
- * - Respuestas: text-only (robusto). Fase 2: interactive buttons/lists.
+ * + Panel Google Sheets (cases + events)
  *
- * Fixes incluidos:
- * ✅ express-rate-limit trust proxy warning (trust proxy = 1)
- * ✅ Limpieza sesiones (TTL)
- * ✅ Dedupe básico por msg.id (evita doble respuesta por retries)
- * ✅ Firma X-Hub-Signature-256 (si hay META_APP_SECRET)
- * ✅ Política seña (NO reintegrable, transferible 24h)
- * ✅ Reminder automático si no envía comprobante (ventana de pago)
- *
- * Capa “natural” agregada:
- * ✅ Saludos (hola/buen día) → 3 variantes random
- * ✅ Cierre (gracias/chau) → 3 variantes random
- * ✅ Registro de operación/comprobante con ID interno (pilot-grade)
- * ✅ Respuesta “multicanal” (orienta: MrTurno / Recepción / Menú)
+ * Incluye:
+ * ✅ Webhook verify + messages: /api/whatsapp y /webhook
+ * ✅ Text-only (robusto) + capa natural (hola/gracias/chau random)
+ * ✅ Seña $ configurable + política (no reintegrable / transferible 24h)
+ * ✅ Registro comprobante con receiptId + log persistente en Sheets
+ * ✅ Dedupe msg.id + sesiones TTL + reminder si no manda comprobante
  */
 
 const express = require('express');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
+const { google } = require('googleapis');
 
 const app = express();
 app.disable('x-powered-by');
@@ -50,11 +43,13 @@ const {
 
   DEPOSIT_REQUIRED = 'true',
   DEPOSIT_AMOUNT = '10000',
-
   PAYMENT_WINDOW_MINUTES = '60',
 
-  // opcional para “multicanal real” a futuro:
-  // LEADS_WEBHOOK_URL, // por ej. endpoint tuyo / notion automation
+  // Google Sheets
+  GSHEET_SPREADSHEET_ID,
+  GSHEET_SA_JSON_BASE64, // recomendado (Render)
+  GSHEET_CLIENT_EMAIL,   // alternativa
+  GSHEET_PRIVATE_KEY,    // alternativa
 } = process.env;
 
 const STARTED_AT = Date.now();
@@ -97,8 +92,11 @@ function randPick(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
-function makeReceiptId(prefix = 'CEPA') {
-  // corto, legible, unique-ish
+function nowISO() {
+  return new Date().toISOString();
+}
+
+function makeId(prefix = 'ID') {
   const ts = Date.now().toString(36).toUpperCase();
   const r = crypto.randomBytes(3).toString('hex').toUpperCase();
   return `${prefix}-${ts}-${r}`;
@@ -157,6 +155,90 @@ const PAYMENT_WINDOW_MS = (() => {
 function moneyARS(n) {
   try { return new Intl.NumberFormat('es-AR').format(n); }
   catch { return String(n); }
+}
+
+// ===== Google Sheets (panel) =====
+function getServiceAccount() {
+  if (GSHEET_SA_JSON_BASE64) {
+    const raw = Buffer.from(GSHEET_SA_JSON_BASE64, 'base64').toString('utf8');
+    return JSON.parse(raw);
+  }
+  if (GSHEET_CLIENT_EMAIL && GSHEET_PRIVATE_KEY) {
+    return {
+      client_email: GSHEET_CLIENT_EMAIL,
+      private_key: GSHEET_PRIVATE_KEY.replace(/\\n/g, '\n'),
+    };
+  }
+  return null;
+}
+
+async function getSheetsClient() {
+  const sa = getServiceAccount();
+  if (!sa || !GSHEET_SPREADSHEET_ID) return null;
+
+  const auth = new google.auth.JWT({
+    email: sa.client_email,
+    key: sa.private_key,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+  });
+
+  return google.sheets({ version: 'v4', auth });
+}
+
+async function sheetAppend(range, values) {
+  try {
+    const sheets = await getSheetsClient();
+    if (!sheets) return { ok: false, reason: 'missing_gsheet_env' };
+
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: GSHEET_SPREADSHEET_ID,
+      range,
+      valueInputOption: 'RAW',
+      insertDataOption: 'INSERT_ROWS',
+      requestBody: { values: [values] },
+    });
+
+    return { ok: true };
+  } catch (e) {
+    log('error', 'gsheet_append_failed', { err: String(e?.message || e), range });
+    return { ok: false, reason: 'append_failed' };
+  }
+}
+
+const caseByWa = new Map(); // wa_id -> case_id
+
+async function ensureCase(waId, patch = {}) {
+  let caseId = caseByWa.get(waId);
+  if (!caseId) {
+    caseId = makeId('CASE');
+    caseByWa.set(waId, caseId);
+
+    await sheetAppend('cases!A:K', [
+      caseId,                 // A case_id
+      nowISO(),               // B created_at
+      waId,                   // C wa_id
+      'whatsapp',             // D source
+      patch.intent_type || '',// E intent_type
+      patch.label || '',      // F label
+      patch.status || 'lead', // G status
+      patch.receipt_id || '', // H receipt_id
+      patch.receipt_hint || '',// I receipt_hint
+      patch.last_message || '',// J last_message
+      nowISO(),               // K updated_at
+    ]);
+  }
+  return caseId;
+}
+
+async function logEvent({ caseId, waId, eventType, payloadPreview }) {
+  return sheetAppend('events!A:F', [
+    makeId('EV'),
+    nowISO(),
+    caseId,
+    waId,
+    eventType,
+    String(payloadPreview || '').slice(0, 220),
+  ]);
 }
 
 // ===== CEPA Data =====
@@ -225,15 +307,15 @@ const OBRAS_SOCIALES_TOP = [
   'Jerárquicos Salud', 'Andes Salud', 'Nobis', 'Federada Salud', 'Medicus'
 ];
 
-// ===== Natural layer triggers =====
+// ===== Natural layer =====
 const GREETINGS = ['hola', 'holaa', 'buen dia', 'buen día', 'buenas', 'buenas tardes', 'buenas noches', 'hey', 'que tal', 'qué tal'];
 const THANKS = ['gracias', 'muchas gracias', 'mil gracias', 'genial gracias', 'graciass'];
 const BYE = ['chau', 'chao', 'hasta luego', 'nos vemos', 'adios', 'adiós', 'bye'];
 
 const GREETING_REPLIES = [
-  `¡Hola! 👋 Soy la recepción automática de ${CEPA.name}.\nDecime qué necesitás o respondé con un número:\n\n1) Sacar turno\n2) Estudios\n3) Estética\n4) Obras sociales\n5) Dirección/horarios\n6) Recepción`,
+  `¡Hola! 👋 Soy la recepción automática de ${CEPA.name}.\n\n1) Sacar turno\n2) Estudios\n3) Estética\n4) Obras sociales\n5) Dirección/horarios\n6) Recepción`,
   `¡Buenas! 👋 Estoy para ayudarte rápido.\nRespondé:\n1) Turno\n2) Estudios\n3) Estética\n4) Obras sociales\n5) Dirección/horarios\n6) Recepción`,
-  `Hola 👋 Bienvenido/a a ${CEPA.name}.\n¿Querés turno o info? (Respondé con número)\n1) Turno · 2) Estudios · 3) Estética · 4) Obras sociales · 5) Dirección/horarios · 6) Recepción`,
+  `Hola 👋 Bienvenido/a a ${CEPA.name}.\n¿Turno o info?\n1) Turno · 2) Estudios · 3) Estética · 4) Obras sociales · 5) Dirección/horarios · 6) Recepción`,
 ];
 
 const CLOSING_REPLIES = [
@@ -242,22 +324,30 @@ const CLOSING_REPLIES = [
   `Listo ✅ Te leo cuando quieras. (Escribí “menú” para ver opciones)`,
 ];
 
+function isGreeting(norm) {
+  return GREETINGS.some((g) => norm === normalize(g) || norm.startsWith(normalize(g)));
+}
+function isThanksOrBye(norm) {
+  const hasThanks = THANKS.some((t) => norm === normalize(t) || norm.includes(normalize(t)));
+  const hasBye = BYE.some((b) => norm === normalize(b) || norm.includes(normalize(b)));
+  return hasThanks || hasBye;
+}
+function maybeLooksLikeReceiptText(norm) {
+  return (
+    norm.includes('comprobante') ||
+    norm.includes('transfer') ||
+    norm.includes('id') ||
+    norm.includes('op') ||
+    /\d{6,}/.test(norm)
+  );
+}
+
 // ===== Sessions + dedupe =====
-/**
- * sessions: wa_id -> { state, context, updatedAt }
- * context:
- *  - type, label
- *  - awaitingSince, reminderSent, reminderTimer
- *  - lastReceiptId (último comprobante)
- */
-const sessions = new Map();
+const sessions = new Map(); // wa_id -> { state, context, updatedAt }
 const SESSION_TTL_MS = 60 * 60 * 1000;
 
-const seenMsg = new Map();
+const seenMsg = new Map(); // msgId -> ts
 const SEEN_TTL_MS = 10 * 60 * 1000;
-
-// Registro in-memory del piloto (para mostrar “trazabilidad”)
-const receiptsLog = new Map(); // receiptId -> { waId, at, kind, rawHint }
 
 function gc() {
   const now = Date.now();
@@ -271,12 +361,6 @@ function gc() {
 
   for (const [id, ts] of seenMsg.entries()) {
     if (!ts || now - ts > SEEN_TTL_MS) seenMsg.delete(id);
-  }
-
-  // receiptsLog: lo dejamos 48h
-  const RECEIPT_TTL = 48 * 60 * 60 * 1000;
-  for (const [rid, r] of receiptsLog.entries()) {
-    if (!r?.at || now - r.at > RECEIPT_TTL) receiptsLog.delete(rid);
   }
 }
 setInterval(gc, 60 * 1000).unref();
@@ -305,7 +389,7 @@ function findMatch(norm, list) {
   return null;
 }
 
-// ===== Payment reminder scheduling =====
+// ===== Reminder =====
 function schedulePaymentReminder(waId) {
   if (!DEPOSIT_ON) return;
 
@@ -313,7 +397,6 @@ function schedulePaymentReminder(waId) {
   if (s.state !== 'awaiting_receipt') return;
   if (s?.context?.reminderTimer) return;
 
-  const createdAt = Date.now();
   const timer = setTimeout(async () => {
     try {
       const cur = getSession(waId);
@@ -323,6 +406,19 @@ function schedulePaymentReminder(waId) {
       setSession(waId, {
         state: 'awaiting_receipt',
         context: { ...cur.context, reminderSent: true },
+      });
+
+      const caseId = await ensureCase(waId, {
+        intent_type: cur.context?.type || '',
+        label: cur.context?.label || '',
+        status: 'awaiting_receipt',
+      });
+
+      await logEvent({
+        caseId,
+        waId,
+        eventType: 'reminder',
+        payloadPreview: 'payment_reminder_sent',
       });
 
       await sendText(
@@ -336,7 +432,7 @@ function schedulePaymentReminder(waId) {
 
   setSession(waId, {
     state: 'awaiting_receipt',
-    context: { ...s.context, awaitingSince: createdAt, reminderTimer: timer, reminderSent: false },
+    context: { ...s.context, reminderTimer: timer, reminderSent: false },
   });
 }
 
@@ -432,6 +528,16 @@ Apenas lo reciba, te genero un comprobante con ID y queda confirmado.`
   );
 }
 
+function receiptAckText(receiptId) {
+  return (
+`Recibido ✅ Ya registré tu seña.
+
+🧾 Este es tu comprobante: ${receiptId}
+
+${DEPOSIT_POLICY.copy_short(DEPOSIT_VALUE)}`
+  );
+}
+
 function finalConfirmedText(receiptId) {
   const depositLine = DEPOSIT_ON ? `\n✅ Seña registrada: $${moneyARS(DEPOSIT_VALUE)}.` : '';
   const receiptLine = receiptId ? `\n🧾 Comprobante: ${receiptId}` : '';
@@ -444,46 +550,26 @@ Si necesitás reprogramar, escribí “recepción”.`
   );
 }
 
-function receiptAckText(receiptId) {
-  return (
-`Recibido ✅ Ya registré tu seña.
+// ===== Receipt register (Sheets) =====
+async function registerReceiptInSheets({ waId, kind, hint }) {
+  const receiptId = makeId('CEPA');
+  const caseId = await ensureCase(waId, {
+    intent_type: kind || '',
+    label: '',
+    status: 'confirmed',
+    receipt_id: receiptId,
+    receipt_hint: hint || '',
+    last_message: '',
+  });
 
-🧾 Este es tu comprobante: ${receiptId}
+  await logEvent({
+    caseId,
+    waId,
+    eventType: 'receipt',
+    payloadPreview: `receipt_id=${receiptId} hint=${String(hint || '').slice(0, 80)}`,
+  });
 
-${DEPOSIT_POLICY.copy_short(DEPOSIT_VALUE)}`
-  );
-}
-
-// ===== Helpers: detect greetings/closing =====
-function isGreeting(norm) {
-  return GREETINGS.some((g) => norm === normalize(g) || norm.startsWith(normalize(g)));
-}
-function isThanksOrBye(norm) {
-  const hasThanks = THANKS.some((t) => norm === normalize(t) || norm.includes(normalize(t)));
-  const hasBye = BYE.some((b) => norm === normalize(b) || norm.includes(normalize(b)));
-  return hasThanks || hasBye;
-}
-
-// ===== Receipt registration =====
-function registerReceipt({ waId, kind, rawHint }) {
-  const receiptId = makeReceiptId('CEPA');
-  receiptsLog.set(receiptId, { waId, at: Date.now(), kind, rawHint: rawHint || null });
-
-  // guardamos en sesión también
-  const s = getSession(waId);
-  setSession(waId, { state: s.state, context: { ...s.context, lastReceiptId: receiptId } });
-
-  return receiptId;
-}
-
-function maybeLooksLikeReceiptText(norm) {
-  return (
-    norm.includes('comprobante') ||
-    norm.includes('transfer') ||
-    norm.includes('id') ||
-    norm.includes('op') ||
-    /\d{6,}/.test(norm)
-  );
+  return { caseId, receiptId };
 }
 
 // ===== Flow =====
@@ -491,31 +577,40 @@ async function handleUserText(waId, rawText) {
   const norm = normalize(rawText);
   const session = getSession(waId);
 
-  // capa natural: saludo
+  // Natural: saludo
   if (isGreeting(norm) && session.state === 'menu') {
+    const caseId = await ensureCase(waId, { status: 'lead', last_message: rawText.slice(0, 140) });
+    await logEvent({ caseId, waId, eventType: 'inbound', payloadPreview: rawText });
     return sendText(waId, randPick(GREETING_REPLIES));
   }
 
-  // capa natural: cierre (gracias/chau)
+  // Natural: cierre (pero si espera comprobante, NO lo dejamos cortar)
   if (isThanksOrBye(norm) && session.state !== 'awaiting_receipt') {
-    // si está esperando comprobante, no cortamos; lo guiamos
+    const caseId = await ensureCase(waId, { status: 'lead', last_message: rawText.slice(0, 140) });
+    await logEvent({ caseId, waId, eventType: 'inbound', payloadPreview: rawText });
     return sendText(waId, randPick(CLOSING_REPLIES));
   }
 
-  // comandos globales
+  // Comandos globales
   if (norm === '0' || norm === 'menu' || norm === 'inicio') {
     resetSession(waId);
+    const caseId = await ensureCase(waId, { status: 'lead', last_message: rawText.slice(0, 140) });
+    await logEvent({ caseId, waId, eventType: 'status_change', payloadPreview: 'status=menu' });
     return sendText(waId, menuText());
   }
 
-  // accesos rápidos
+  // Accesos rápidos
   if (norm.includes('horario') || norm.includes('direccion') || norm.includes('ubic')) {
     resetSession(waId);
+    const caseId = await ensureCase(waId, { status: 'lead', last_message: rawText.slice(0, 140) });
+    await logEvent({ caseId, waId, eventType: 'info', payloadPreview: 'asked=contact_info' });
     return sendText(waId, infoContacto());
   }
 
   if (norm.includes('obra') || norm.includes('prepaga') || norm.includes('osde') || norm.includes('swiss')) {
     resetSession(waId);
+    const caseId = await ensureCase(waId, { status: 'lead', last_message: rawText.slice(0, 140) });
+    await logEvent({ caseId, waId, eventType: 'info', payloadPreview: 'asked=insurance' });
     return sendText(
       waId,
       `Trabajamos con varias obras sociales/prepagas. Algunas frecuentes:\n• ${OBRAS_SOCIALES_TOP.join('\n• ')}\n\nSi me decís cuál tenés, te confirmo si está.`
@@ -524,40 +619,67 @@ async function handleUserText(waId, rawText) {
 
   if (norm.includes('recep') || norm.includes('humano') || norm.includes('persona')) {
     setSession(waId, { state: 'handoff', context: {} });
+
+    const caseId = await ensureCase(waId, {
+      intent_type: 'recepcion',
+      status: 'handoff',
+      last_message: rawText.slice(0, 140),
+    });
+
+    await logEvent({ caseId, waId, eventType: 'status_change', payloadPreview: 'status=handoff' });
+
     return sendText(
       waId,
       `Listo ✅ Te paso con recepción.\nContame en 1 línea qué necesitás (especialidad/estudio + día preferido).`
     );
   }
 
-  // LISTO => pedir comprobante (si aplica)
+  // LISTO
   if (norm === 'listo' || norm === 'ok' || norm === 'dale' || norm === 'ya') {
-    // si veníamos de mrturno/awaiting, pedimos comprobante
     if (session.state === 'awaiting_receipt') {
       schedulePaymentReminder(waId);
+      const caseId = await ensureCase(waId, {
+        intent_type: session.context?.type || '',
+        label: session.context?.label || '',
+        status: 'awaiting_receipt',
+        last_message: rawText.slice(0, 140),
+      });
+      await logEvent({ caseId, waId, eventType: 'status_change', payloadPreview: 'status=awaiting_receipt' });
       return sendText(waId, askReceiptText());
     }
+
     resetSession(waId);
+    const caseId = await ensureCase(waId, { status: 'lead', last_message: rawText.slice(0, 140) });
+    await logEvent({ caseId, waId, eventType: 'inbound', payloadPreview: rawText });
     return sendText(waId, `Perfecto. ¿En qué te ayudo?\n\n${menuText()}`);
   }
 
-  // Si está esperando comprobante y el usuario manda texto que parece comprobante:
+  // Si espera comprobante y manda algo “tipo comprobante”
   if (session.state === 'awaiting_receipt' && maybeLooksLikeReceiptText(norm)) {
-    // registrar comprobante con ID interno
-    const receiptId = registerReceipt({ waId, kind: session.context?.type || 'unknown', rawHint: rawText.trim().slice(0, 120) });
+    const { receiptId } = await registerReceiptInSheets({
+      waId,
+      kind: session.context?.type || 'unknown',
+      hint: rawText.trim().slice(0, 120),
+    });
+
     resetSession(waId);
     await sendText(waId, receiptAckText(receiptId));
     return sendText(waId, finalConfirmedText(receiptId));
   }
 
-  // state machine
+  // Máquina de estados
   if (session.state === 'menu') {
+    const caseId = await ensureCase(waId, { status: 'lead', last_message: rawText.slice(0, 140) });
+    await logEvent({ caseId, waId, eventType: 'inbound', payloadPreview: rawText });
+
     if (norm === '1') {
       setSession(waId, { state: 'turnos' });
+      await logEvent({ caseId, waId, eventType: 'status_change', payloadPreview: 'state=turnos' });
       return sendText(waId, turnosPrompt());
     }
     if (norm === '2') {
       setSession(waId, { state: 'estudios' });
+      await logEvent({ caseId, waId, eventType: 'status_change', payloadPreview: 'state=estudios' });
       return sendText(waId, estudiosPrompt());
     }
     if (norm === '3') {
@@ -580,13 +702,10 @@ async function handleUserText(waId, rawText) {
     }
     if (norm === '6') {
       setSession(waId, { state: 'handoff', context: {} });
-      return sendText(
-        waId,
-        `Dale ✅ Contame en 1 línea qué necesitás (especialidad/estudio + día preferido) y te ayudo.`
-      );
+      await logEvent({ caseId, waId, eventType: 'status_change', payloadPreview: 'status=handoff' });
+      return sendText(waId, `Dale ✅ Contame en 1 línea qué necesitás (especialidad/estudio + día preferido) y te ayudo.`);
     }
 
-    // fallback inteligente
     if (norm.includes('turno')) {
       setSession(waId, { state: 'turnos' });
       return sendText(waId, turnosPrompt());
@@ -602,6 +721,16 @@ async function handleUserText(waId, rawText) {
   if (session.state === 'turnos') {
     const sendMrTurno = async (label) => {
       setSession(waId, { state: 'awaiting_receipt', context: { type: 'turno', label } });
+
+      const caseId = await ensureCase(waId, {
+        intent_type: 'turno',
+        label,
+        status: 'awaiting_receipt',
+        last_message: rawText.slice(0, 140),
+      });
+
+      await logEvent({ caseId, waId, eventType: 'status_change', payloadPreview: `status=awaiting_receipt label=${label}` });
+
       await sendText(waId, mrturnoText(`Perfecto: ${label}.`));
       await sendText(waId, askReceiptText());
       schedulePaymentReminder(waId);
@@ -630,6 +759,10 @@ async function handleUserText(waId, rawText) {
     const label = match ? match.label : rawText.trim();
 
     setSession(waId, { state: 'awaiting_receipt', context: { type: 'turno', label } });
+
+    const caseId = await ensureCase(waId, { intent_type: 'turno', label, status: 'awaiting_receipt', last_message: rawText.slice(0, 140) });
+    await logEvent({ caseId, waId, eventType: 'status_change', payloadPreview: `status=awaiting_receipt label=${label}` });
+
     await sendText(waId, mrturnoText(`Perfecto: ${label}.`));
     await sendText(waId, askReceiptText());
     schedulePaymentReminder(waId);
@@ -639,6 +772,10 @@ async function handleUserText(waId, rawText) {
   if (session.state === 'estudios') {
     const sendMrTurno = async (label) => {
       setSession(waId, { state: 'awaiting_receipt', context: { type: 'estudio', label } });
+
+      const caseId = await ensureCase(waId, { intent_type: 'estudio', label, status: 'awaiting_receipt', last_message: rawText.slice(0, 140) });
+      await logEvent({ caseId, waId, eventType: 'status_change', payloadPreview: `status=awaiting_receipt label=${label}` });
+
       await sendText(waId, mrturnoText(`Perfecto: ${label}.`));
       await sendText(waId, askReceiptText());
       schedulePaymentReminder(waId);
@@ -658,9 +795,7 @@ async function handleUserText(waId, rawText) {
       '10': null,
     };
 
-    if (Object.prototype.hasOwnProperty.call(byNum, norm) && byNum[norm]) {
-      return sendMrTurno(byNum[norm]);
-    }
+    if (Object.prototype.hasOwnProperty.call(byNum, norm) && byNum[norm]) return sendMrTurno(byNum[norm]);
 
     if (norm === '10') {
       setSession(waId, { state: 'awaiting_study_text', context: {} });
@@ -678,6 +813,10 @@ async function handleUserText(waId, rawText) {
     const label = match ? match.label : rawText.trim();
 
     setSession(waId, { state: 'awaiting_receipt', context: { type: 'estudio', label } });
+
+    const caseId = await ensureCase(waId, { intent_type: 'estudio', label, status: 'awaiting_receipt', last_message: rawText.slice(0, 140) });
+    await logEvent({ caseId, waId, eventType: 'status_change', payloadPreview: `status=awaiting_receipt label=${label}` });
+
     await sendText(waId, mrturnoText(`Perfecto: ${label}.`));
     await sendText(waId, askReceiptText());
     schedulePaymentReminder(waId);
@@ -685,17 +824,18 @@ async function handleUserText(waId, rawText) {
   }
 
   if (session.state === 'awaiting_receipt') {
-    // si no parece comprobante, insistimos + no cortamos con chau/gracias
+    // No cortamos el flujo con “chau/gracias”: insistimos suave
     schedulePaymentReminder(waId);
+    const caseId = await ensureCase(waId, { intent_type: session.context?.type || '', label: session.context?.label || '', status: 'awaiting_receipt', last_message: rawText.slice(0, 140) });
+    await logEvent({ caseId, waId, eventType: 'inbound', payloadPreview: rawText });
     return sendText(waId, askReceiptText());
   }
 
   if (session.state === 'handoff') {
     resetSession(waId);
-    return sendText(
-      waId,
-      `Perfecto ✅ Ya quedó. En breve te responde recepción.\n\nMientras tanto, si querés sacar turno rápido: ${CEPA.mrturno}`
-    );
+    const caseId = await ensureCase(waId, { intent_type: 'recepcion', status: 'handoff', last_message: rawText.slice(0, 140) });
+    await logEvent({ caseId, waId, eventType: 'handoff', payloadPreview: rawText });
+    return sendText(waId, `Perfecto ✅ Ya quedó. En breve te responde recepción.\n\nMientras tanto, si querés sacar turno rápido: ${CEPA.mrturno}`);
   }
 
   resetSession(waId);
@@ -804,14 +944,22 @@ async function postHandler(req, res) {
     if (hasMedia) {
       const s = getSession(from);
 
-      // Si llega media y estamos esperando comprobante => registramos receipt + confirmamos
+      // Si llega media y estamos esperando comprobante => registrar + confirmar
       if (s.state === 'awaiting_receipt') {
-        const receiptId = registerReceipt({ waId: from, kind: s.context?.type || 'unknown', rawHint: 'media' });
+        const { receiptId } = await registerReceiptInSheets({
+          waId: from,
+          kind: s.context?.type || 'unknown',
+          hint: 'media',
+        });
+
         resetSession(from);
         await sendText(from, receiptAckText(receiptId));
         await sendText(from, finalConfirmedText(receiptId));
         return;
       }
+
+      const caseId = await ensureCase(from, { status: 'lead', last_message: 'media_received' });
+      await logEvent({ caseId, waId: from, eventType: 'inbound_media', payloadPreview: 'media' });
 
       await sendText(from, `Recibido ✅ ¿Querés sacar turno o necesitás recepción?\n\n${menuText()}`);
       return;
@@ -819,8 +967,14 @@ async function postHandler(req, res) {
 
     if (!text.trim()) {
       resetSession(from);
+      const caseId = await ensureCase(from, { status: 'lead', last_message: '(empty_text)' });
+      await logEvent({ caseId, waId: from, eventType: 'inbound', payloadPreview: '(empty_text)' });
       return sendText(from, menuText());
     }
+
+    // Log inbound (auditoría)
+    const caseId = await ensureCase(from, { status: 'lead', last_message: text.slice(0, 140) });
+    await logEvent({ caseId, waId: from, eventType: 'inbound', payloadPreview: text });
 
     await handleUserText(from, text);
   } catch (e) {
@@ -828,7 +982,7 @@ async function postHandler(req, res) {
   }
 }
 
-// Importante: raw body para firma
+// raw body para firma
 app.get('/api/whatsapp', verifyHandler);
 app.get('/webhook', verifyHandler);
 
@@ -847,5 +1001,6 @@ app.listen(port, '0.0.0.0', () => {
     deposit_required: DEPOSIT_ON,
     deposit_amount: DEPOSIT_VALUE,
     payment_window_minutes: Math.round(PAYMENT_WINDOW_MS / 60000),
+    has_gsheet: !!GSHEET_SPREADSHEET_ID && (!!GSHEET_SA_JSON_BASE64 || (!!GSHEET_CLIENT_EMAIL && !!GSHEET_PRIVATE_KEY)),
   });
 });
