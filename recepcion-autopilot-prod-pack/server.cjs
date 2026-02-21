@@ -117,6 +117,13 @@ function moneyARS(n) {
   catch { return String(n); }
 }
 
+function extractOperationId(text) {
+  const s = String(text || '');
+  // busca números largos típicos de operación (>=6 dígitos)
+  const m = s.match(/\b(\d{6,})\b/);
+  return m ? m[1] : '';
+}
+
 async function sendText(toWaId, text) {
   if (!WA_ACCESS_TOKEN || !WA_PHONE_NUMBER_ID) {
     log('warn', 'wa_outbound_not_configured', {
@@ -215,6 +222,7 @@ async function sheetAppend(range, values) {
   }
 }
 
+// Mantiene un caseId estable por WA (y appendea filas como auditoría por estado)
 const caseByWa = new Map(); // wa_id -> case_id
 
 async function ensureCase(waId, patch = {}) {
@@ -222,42 +230,51 @@ async function ensureCase(waId, patch = {}) {
   if (!caseId) {
     caseId = makeId('CASE');
     caseByWa.set(waId, caseId);
-
-    await sheetAppend('cases!A:K', [
-      caseId,                  // A case_id
-      nowISO(),                // B created_at
-      waId,                    // C wa_id
-      'whatsapp',              // D source
-      patch.intent_type || '', // E intent_type
-      patch.label || '',       // F label
-      patch.status || 'lead',  // G status
-      patch.receipt_id || '',  // H receipt_id
-      patch.receipt_hint || '',// I receipt_hint
-      patch.last_message || '',// J last_message
-      nowISO(),                // K updated_at
-    ]);
   }
+
+  const flowType = patch.flow_type || patch.intent_type || '';
+  const serviceLabel = patch.service_label || patch.label || '';
+
+  const row = [
+    nowISO(),                           // A created_at
+    caseId,                             // B case_id
+    waId,                               // C wa_from
+    flowType,                           // D flow_type
+    patch.patient_type || patch.patientType || '', // E patient_type
+    patch.os_name || patch.osName || '',           // F os_name
+    patch.os_token || patch.osToken || '',         // G os_token
+    serviceLabel,                       // H service_label
+    patch.deposit_amount ?? (DEPOSIT_ON ? DEPOSIT_VALUE : ''), // I deposit_amount
+    patch.payment_link || '',           // J payment_link
+    patch.payment_op_id || '',          // K payment_op_id
+    patch.status || 'lead',             // L status
+    patch.last_message || '',           // M last_message
+    nowISO(),                           // N updated_at
+  ];
+
+  await sheetAppend('cases!A:N', row);
   return caseId;
 }
 
-async function logEvent({ caseId, waId, eventType, payloadPreview }) {
-  return sheetAppend('events!A:F', [
-    makeId('EV'),
-    nowISO(),
-    caseId,
-    waId,
-    eventType,
-    String(payloadPreview || '').slice(0, 220),
+async function logEvent({ caseId, waId, eventType, payloadPreview, payload }) {
+  return sheetAppend('events!A:G', [
+    makeId('EV'),                              // A event_id
+    nowISO(),                                  // B created_at
+    caseId,                                    // C case_id
+    waId,                                      // D wa_from
+    eventType,                                 // E event_type
+    String(payloadPreview || '').slice(0, 220), // F payload_preview
+    payload ? JSON.stringify(payload).slice(0, 800) : '', // G payload
   ]);
 }
 
-async function registerReceiptInSheets({ waId, kind, hint }) {
+async function registerReceiptInSheets({ waId, kind, hint, paymentOpId }) {
   const receiptId = makeId('CEPA');
+
   const caseId = await ensureCase(waId, {
     intent_type: kind || '',
     status: 'confirmed',
-    receipt_id: receiptId,
-    receipt_hint: hint || '',
+    payment_op_id: paymentOpId || '',
     last_message: '',
   });
 
@@ -265,7 +282,8 @@ async function registerReceiptInSheets({ waId, kind, hint }) {
     caseId,
     waId,
     eventType: 'receipt',
-    payloadPreview: `receipt_id=${receiptId} hint=${String(hint || '').slice(0, 80)}`,
+    payloadPreview: `receipt_id=${receiptId} op=${paymentOpId || ''} hint=${String(hint || '').slice(0, 40)}`,
+    payload: { receiptId, paymentOpId: paymentOpId || null, hint: hint || null },
   });
 
   return { caseId, receiptId };
@@ -275,7 +293,6 @@ async function registerReceiptInSheets({ waId, kind, hint }) {
 async function createMpPreference({ caseId, waId, label, patientType, osName, osToken, amount }) {
   if (!MP_ACCESS_TOKEN) return { ok: false, reason: 'missing_mp_token' };
 
-  // ventana para pago
   const expiresFrom = new Date();
   const expiresTo = new Date(Date.now() + PAYMENT_WINDOW_MS);
 
@@ -487,9 +504,13 @@ function schedulePaymentReminder(waId) {
       });
 
       const caseId = await ensureCase(waId, {
-        intent_type: cur.context?.type || '',
-        label: cur.context?.label || '',
+        flow_type: cur.context?.type || '',
+        service_label: cur.context?.label || '',
+        patient_type: cur.context?.patientType || '',
+        os_name: cur.context?.osName || '',
+        os_token: cur.context?.osToken || '',
         status: 'awaiting_payment',
+        last_message: '',
       });
 
       await logEvent({
@@ -683,7 +704,7 @@ async function handleUserText(waId, rawText) {
     setSession(waId, { state: 'handoff', context: {} });
 
     const caseId = await ensureCase(waId, {
-      intent_type: 'recepcion',
+      flow_type: 'recepcion',
       status: 'handoff',
       last_message: rawText.slice(0, 140),
     });
@@ -699,7 +720,6 @@ async function handleUserText(waId, rawText) {
   // LISTO => lo llevamos a pago (si ya eligió label)
   if (norm === 'listo' || norm === 'ok' || norm === 'dale' || norm === 'ya') {
     if (session.state === 'awaiting_mrturno_done') {
-      // pedir tipo paciente
       setSession(waId, { state: 'ask_patient_type', context: { ...session.context } });
       return sendText(waId, patientTypePrompt());
     }
@@ -712,10 +732,34 @@ async function handleUserText(waId, rawText) {
 
   // Si espera pago y manda algo “tipo comprobante”
   if (session.state === 'awaiting_payment' && maybeLooksLikeReceiptText(norm)) {
+    const opId = extractOperationId(rawText) || '';
+
+    // auditoría cases
+    const caseId = await ensureCase(waId, {
+      flow_type: session.context?.type || '',
+      service_label: session.context?.label || '',
+      patient_type: session.context?.patientType || '',
+      os_name: session.context?.osName || '',
+      os_token: session.context?.osToken || '',
+      payment_link: session.context?.mp?.init_point || '',
+      payment_op_id: opId,
+      status: 'confirmed',
+      last_message: rawText.slice(0, 140),
+    });
+
+    await logEvent({
+      caseId,
+      waId,
+      eventType: 'payment_proof_text',
+      payloadPreview: opId ? `op_id=${opId}` : 'proof_text',
+      payload: { opId: opId || null, text: rawText.slice(0, 300) },
+    });
+
     const { receiptId } = await registerReceiptInSheets({
       waId,
       kind: session.context?.type || 'unknown',
       hint: rawText.trim().slice(0, 120),
+      paymentOpId: opId,
     });
 
     resetSession(waId);
@@ -779,13 +823,18 @@ async function handleUserText(waId, rawText) {
       setSession(waId, { state: 'awaiting_mrturno_done', context: { type: 'turno', label } });
 
       const caseId = await ensureCase(waId, {
-        intent_type: 'turno',
-        label,
+        flow_type: 'turno',
+        service_label: label,
         status: 'awaiting_mrturno',
         last_message: rawText.slice(0, 140),
       });
 
-      await logEvent({ caseId, waId, eventType: 'status_change', payloadPreview: `status=awaiting_mrturno label=${label}` });
+      await logEvent({
+        caseId,
+        waId,
+        eventType: 'status_change',
+        payloadPreview: `status=awaiting_mrturno label=${label}`,
+      });
 
       return sendText(waId, mrturnoText(`Perfecto: ${label}.`));
     };
@@ -813,9 +862,14 @@ async function handleUserText(waId, rawText) {
 
     setSession(waId, { state: 'awaiting_mrturno_done', context: { type: 'turno', label } });
 
-    const caseId = await ensureCase(waId, { intent_type: 'turno', label, status: 'awaiting_mrturno', last_message: rawText.slice(0, 140) });
-    await logEvent({ caseId, waId, eventType: 'status_change', payloadPreview: `status=awaiting_mrturno label=${label}` });
+    const caseId = await ensureCase(waId, {
+      flow_type: 'turno',
+      service_label: label,
+      status: 'awaiting_mrturno',
+      last_message: rawText.slice(0, 140),
+    });
 
+    await logEvent({ caseId, waId, eventType: 'status_change', payloadPreview: `status=awaiting_mrturno label=${label}` });
     return sendText(waId, mrturnoText(`Perfecto: ${label}.`));
   }
 
@@ -823,9 +877,14 @@ async function handleUserText(waId, rawText) {
     const sendMrTurno = async (label) => {
       setSession(waId, { state: 'awaiting_mrturno_done', context: { type: 'estudio', label } });
 
-      const caseId = await ensureCase(waId, { intent_type: 'estudio', label, status: 'awaiting_mrturno', last_message: rawText.slice(0, 140) });
-      await logEvent({ caseId, waId, eventType: 'status_change', payloadPreview: `status=awaiting_mrturno label=${label}` });
+      const caseId = await ensureCase(waId, {
+        flow_type: 'estudio',
+        service_label: label,
+        status: 'awaiting_mrturno',
+        last_message: rawText.slice(0, 140),
+      });
 
+      await logEvent({ caseId, waId, eventType: 'status_change', payloadPreview: `status=awaiting_mrturno label=${label}` });
       return sendText(waId, mrturnoText(`Perfecto: ${label}.`));
     };
 
@@ -861,9 +920,14 @@ async function handleUserText(waId, rawText) {
 
     setSession(waId, { state: 'awaiting_mrturno_done', context: { type: 'estudio', label } });
 
-    const caseId = await ensureCase(waId, { intent_type: 'estudio', label, status: 'awaiting_mrturno', last_message: rawText.slice(0, 140) });
-    await logEvent({ caseId, waId, eventType: 'status_change', payloadPreview: `status=awaiting_mrturno label=${label}` });
+    const caseId = await ensureCase(waId, {
+      flow_type: 'estudio',
+      service_label: label,
+      status: 'awaiting_mrturno',
+      last_message: rawText.slice(0, 140),
+    });
 
+    await logEvent({ caseId, waId, eventType: 'status_change', payloadPreview: `status=awaiting_mrturno label=${label}` });
     return sendText(waId, mrturnoText(`Perfecto: ${label}.`));
   }
 
@@ -871,7 +935,15 @@ async function handleUserText(waId, rawText) {
   if (session.state === 'ask_patient_type') {
     if (norm === '1') {
       const { type, label } = session.context || {};
-      const caseId = await ensureCase(waId, { intent_type: type || '', label: label || '', status: 'awaiting_payment', last_message: rawText.slice(0, 140) });
+
+      const caseId = await ensureCase(waId, {
+        flow_type: type || '',
+        service_label: label || '',
+        patient_type: 'particular',
+        status: 'awaiting_payment',
+        last_message: rawText.slice(0, 140),
+      });
+
       await logEvent({ caseId, waId, eventType: 'patient_type', payloadPreview: 'particular' });
 
       const mp = await createMpPreference({
@@ -886,8 +958,25 @@ async function handleUserText(waId, rawText) {
       schedulePaymentReminder(waId);
 
       if (!mp.ok) {
+        await ensureCase(waId, {
+          flow_type: type || '',
+          service_label: label || '',
+          patient_type: 'particular',
+          status: 'mp_failed',
+          last_message: 'mp_preference_failed',
+        });
         return sendText(waId, `Perfecto ✅ Para confirmar necesitamos la seña de $${moneyARS(DEPOSIT_VALUE)}.\n\nAhora mismo no pude generar el link.\nEscribí “recepción” y te lo resuelven.`);
       }
+
+      // guardar link en cases
+      await ensureCase(waId, {
+        flow_type: type || '',
+        service_label: label || '',
+        patient_type: 'particular',
+        status: 'awaiting_payment',
+        payment_link: mp.init_point,
+        last_message: 'mp_link_sent',
+      });
 
       return sendText(waId, paymentLinkText(mp.init_point));
     }
@@ -909,8 +998,22 @@ async function handleUserText(waId, rawText) {
     const { type, label, osName } = session.context || {};
     const osToken = rawText.trim();
 
-    const caseId = await ensureCase(waId, { intent_type: type || '', label: label || '', status: 'awaiting_payment', last_message: rawText.slice(0, 140) });
-    await logEvent({ caseId, waId, eventType: 'os_data', payloadPreview: `os=${osName} token=${osToken.slice(0, 80)}` });
+    const caseId = await ensureCase(waId, {
+      flow_type: type || '',
+      service_label: label || '',
+      patient_type: 'obra_social',
+      os_name: osName || '',
+      os_token: osToken,
+      status: 'awaiting_payment',
+      last_message: rawText.slice(0, 140),
+    });
+
+    await logEvent({
+      caseId,
+      waId,
+      eventType: 'os_data',
+      payloadPreview: `os=${osName} token=${osToken.slice(0, 80)}`,
+    });
 
     const mp = await createMpPreference({
       caseId,
@@ -926,23 +1029,57 @@ async function handleUserText(waId, rawText) {
     schedulePaymentReminder(waId);
 
     if (!mp.ok) {
+      await ensureCase(waId, {
+        flow_type: type || '',
+        service_label: label || '',
+        patient_type: 'obra_social',
+        os_name: osName || '',
+        os_token: osToken,
+        status: 'mp_failed',
+        last_message: 'mp_preference_failed',
+      });
       return sendText(waId, `Listo ✅ Tomé tus datos.\nPara confirmar necesitamos la seña de $${moneyARS(DEPOSIT_VALUE)}.\n\nAhora no pude generar el link.\nEscribí “recepción” y te lo hacen manual.`);
     }
+
+    // guardar link en cases
+    await ensureCase(waId, {
+      flow_type: type || '',
+      service_label: label || '',
+      patient_type: 'obra_social',
+      os_name: osName || '',
+      os_token: osToken,
+      status: 'awaiting_payment',
+      payment_link: mp.init_point,
+      last_message: 'mp_link_sent',
+    });
 
     return sendText(waId, paymentLinkText(mp.init_point));
   }
 
   if (session.state === 'awaiting_payment') {
-    // no cortamos con “chau/gracias”
     schedulePaymentReminder(waId);
-    const caseId = await ensureCase(waId, { intent_type: session.context?.type || '', label: session.context?.label || '', status: 'awaiting_payment', last_message: rawText.slice(0, 140) });
-    await logEvent({ caseId, waId, eventType: 'inbound', payloadPreview: rawText });
+
+    await ensureCase(waId, {
+      flow_type: session.context?.type || '',
+      service_label: session.context?.label || '',
+      patient_type: session.context?.patientType || '',
+      os_name: session.context?.osName || '',
+      os_token: session.context?.osToken || '',
+      payment_link: session.context?.mp?.init_point || '',
+      status: 'awaiting_payment',
+      last_message: rawText.slice(0, 140),
+    });
+
     return sendText(waId, `Cuando pagues, mandame el *ID de operación* o una *captura* para confirmarlo ✅`);
   }
 
   if (session.state === 'handoff') {
     resetSession(waId);
-    const caseId = await ensureCase(waId, { intent_type: 'recepcion', status: 'handoff', last_message: rawText.slice(0, 140) });
+    const caseId = await ensureCase(waId, {
+      flow_type: 'recepcion',
+      status: 'handoff',
+      last_message: rawText.slice(0, 140),
+    });
     await logEvent({ caseId, waId, eventType: 'handoff', payloadPreview: rawText });
     return sendText(waId, `Perfecto ✅ Ya quedó. En breve te responde recepción.\n\nMientras tanto, si querés sacar turno rápido: ${CEPA.mrturno}`);
   }
@@ -1054,10 +1191,24 @@ async function postHandler(req, res) {
 
       // Si llega media y estamos esperando pago => registrar + confirmar
       if (s.state === 'awaiting_payment') {
+        const caseId = await ensureCase(from, {
+          flow_type: s.context?.type || '',
+          service_label: s.context?.label || '',
+          patient_type: s.context?.patientType || '',
+          os_name: s.context?.osName || '',
+          os_token: s.context?.osToken || '',
+          payment_link: s.context?.mp?.init_point || '',
+          status: 'confirmed',
+          last_message: 'media_proof',
+        });
+
+        await logEvent({ caseId, waId: from, eventType: 'payment_proof_media', payloadPreview: 'media' });
+
         const { receiptId } = await registerReceiptInSheets({
           waId: from,
           kind: s.context?.type || 'unknown',
           hint: 'media',
+          paymentOpId: '',
         });
 
         resetSession(from);
