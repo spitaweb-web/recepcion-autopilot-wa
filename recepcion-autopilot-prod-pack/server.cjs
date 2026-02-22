@@ -2,14 +2,15 @@
 
 /**
  * CEPA Recepción Autopilot — WhatsApp Cloud API — Node/Express
- * + Google Sheets (cases A:N, events A:G)
+ * + Google Sheets (cases A:N update 1 fila por caso, events A:G append histórico)
  * + MercadoPago seña (preference init_point)
  *
  * Fixes:
- * ✅ GSHEET_ID alias (tu Render usa GSHEET_ID)
+ * ✅ GSHEET_ID alias (Render usa GSHEET_ID)
  * ✅ State-first: no pisa ask_os_name/ask_os_token con atajos
  * ✅ Atajo OSDE/obra social SOLO en menu
- * ✅ Logs gsheet_ready + gsheet_append
+ * ✅ cases = UPDATE (1 fila) / events = APPEND (histórico)
+ * ✅ Logs gsheet_ready + gsheet_append + gsheet_update
  */
 
 const express = require('express');
@@ -51,7 +52,7 @@ const {
   MP_FAILURE_URL,
   MP_PENDING_URL,
 
-  // Google Sheets (tu Render tiene GSHEET_ID)
+  // Google Sheets (Render suele tener GSHEET_ID)
   GSHEET_SPREADSHEET_ID,
   GSHEET_ID,
   GSHEET_SA_JSON_BASE64,
@@ -60,7 +61,6 @@ const {
 } = process.env;
 
 const SPREADSHEET_ID = GSHEET_SPREADSHEET_ID || GSHEET_ID; // ✅ alias
-
 const STARTED_AT = Date.now();
 
 // ========== Util ==========
@@ -108,8 +108,11 @@ function makeId(prefix = 'ID') {
 }
 
 function moneyARS(n) {
-  try { return new Intl.NumberFormat('es-AR').format(n); }
-  catch { return String(n); }
+  try {
+    return new Intl.NumberFormat('es-AR').format(n);
+  } catch {
+    return String(n);
+  }
 }
 
 function extractOpId(text) {
@@ -148,7 +151,9 @@ async function sendText(toWaId, text) {
 
   if (!resp.ok) {
     let j = {};
-    try { j = await resp.json(); } catch {}
+    try {
+      j = await resp.json();
+    } catch {}
     log('error', 'wa_outbound_failed', { status: resp.status, err: j });
     return { ok: false, status: resp.status, err: j };
   }
@@ -198,12 +203,45 @@ async function getSheetsClient() {
   return google.sheets({ version: 'v4', auth });
 }
 
-async function sheetAppend(range, values) {
+function parseRowFromUpdatedRange(updatedRange) {
+  // ej: "cases!A12:N12" => 12
+  const m = String(updatedRange || '').match(/![A-Z]+(\d+):[A-Z]+(\d+)/);
+  if (!m) return null;
+  return Number(m[1]) || null;
+}
+
+async function sheetAppendWithRow(range, values) {
   try {
     const sheets = await getSheetsClient();
     if (!sheets) return { ok: false, reason: 'missing_gsheet_env' };
 
-    log('info', 'gsheet_append', { range }); // ✅ para debug
+    log('info', 'gsheet_append', { range });
+
+    const resp = await sheets.spreadsheets.values.append({
+      spreadsheetId: SPREADSHEET_ID,
+      range,
+      valueInputOption: 'RAW',
+      insertDataOption: 'INSERT_ROWS',
+      requestBody: { values: [values] },
+    });
+
+    const updatedRange = resp?.data?.updates?.updatedRange;
+    const row = parseRowFromUpdatedRange(updatedRange);
+    return { ok: true, row, updatedRange };
+  } catch (e) {
+    log('error', 'gsheet_append_failed', { err: String(e?.message || e), range });
+    return { ok: false, reason: 'append_failed' };
+  }
+}
+
+async function sheetAppend(range, values) {
+  // simple append (events)
+  try {
+    const sheets = await getSheetsClient();
+    if (!sheets) return { ok: false, reason: 'missing_gsheet_env' };
+
+    log('info', 'gsheet_append', { range });
+
     await sheets.spreadsheets.values.append({
       spreadsheetId: SPREADSHEET_ID,
       range,
@@ -219,57 +257,97 @@ async function sheetAppend(range, values) {
   }
 }
 
+async function sheetUpdate(range, values) {
+  try {
+    const sheets = await getSheetsClient();
+    if (!sheets) return { ok: false, reason: 'missing_gsheet_env' };
+
+    log('info', 'gsheet_update', { range });
+
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SPREADSHEET_ID,
+      range,
+      valueInputOption: 'RAW',
+      requestBody: { values: [values] },
+    });
+
+    return { ok: true };
+  } catch (e) {
+    log('error', 'gsheet_update_failed', { err: String(e?.message || e), range });
+    return { ok: false, reason: 'update_failed' };
+  }
+}
+
 // Schema EXACTO:
 // cases A:N = created_at, case_id, wa_from, flow_type, patient_type, os_name, os_token, service_label,
 //             deposit_amount, payment_link, payment_op_id, status, last_message, updated_at
 // events A:G = event_id, created_at, case_id, wa_from, event_type, payload_preview, payload
 
-const caseByWa = new Map(); // waId -> caseId
+const caseStore = new Map(); // waId -> { caseId, row, data }
 
-async function ensureCaseId(waId) {
-  let caseId = caseByWa.get(waId);
-  if (!caseId) {
-    caseId = makeId('CASE');
-    caseByWa.set(waId, caseId);
+function buildCaseRow(waId, caseId, data) {
+  return [
+    data.created_at || nowISO(), // A created_at
+    caseId, // B case_id
+    waId, // C wa_from
+    data.flow_type || 'whatsapp', // D flow_type
+    data.patient_type || '', // E patient_type
+    data.os_name || '', // F os_name
+    data.os_token || '', // G os_token
+    data.service_label || '', // H service_label
+    data.deposit_amount ?? (DEPOSIT_ON ? String(DEPOSIT_VALUE) : ''), // I deposit_amount
+    data.payment_link || '', // J payment_link
+    data.payment_op_id || '', // K payment_op_id
+    data.status || 'lead', // L status
+    data.last_message || '', // M last_message
+    nowISO(), // N updated_at
+  ];
+}
 
-    await sheetAppend('cases!A:N', [
-      nowISO(),               // created_at
-      caseId,                 // case_id
-      waId,                   // wa_from
-      'whatsapp',             // flow_type
-      '', '', '', '',         // patient_type, os_name, os_token, service_label
-      DEPOSIT_ON ? String(DEPOSIT_VALUE) : '', // deposit_amount
-      '', '',                 // payment_link, payment_op_id
-      'lead',                 // status
-      '',                     // last_message
-      nowISO(),               // updated_at
-    ]);
-  }
+async function getOrCreateCaseId(waId) {
+  const cur = caseStore.get(waId);
+  if (cur?.caseId) return cur.caseId;
+
+  const caseId = makeId('CASE');
+  const created_at = nowISO();
+  const data = { created_at, status: 'lead' };
+  const rowValues = buildCaseRow(waId, caseId, data);
+
+  const ap = await sheetAppendWithRow('cases!A:N', rowValues);
+  const row = ap.ok ? ap.row : null;
+
+  caseStore.set(waId, { caseId, row, data });
   return caseId;
 }
 
-async function writeCaseRow(waId, patch) {
-  const caseId = await ensureCaseId(waId);
+async function upsertCase(waId, patch = {}) {
+  const cur = caseStore.get(waId);
 
-  const row = [
-    nowISO(),
-    caseId,
-    waId,
-    patch.flow_type || 'whatsapp',
-    patch.patient_type || '',
-    patch.os_name || '',
-    patch.os_token || '',
-    patch.service_label || '',
-    patch.deposit_amount ?? (DEPOSIT_ON ? String(DEPOSIT_VALUE) : ''),
-    patch.payment_link || '',
-    patch.payment_op_id || '',
-    patch.status || 'lead',
-    patch.last_message || '',
-    nowISO(),
-  ];
+  if (!cur) {
+    const caseId = makeId('CASE');
+    const data = { created_at: nowISO(), ...patch };
+    const rowValues = buildCaseRow(waId, caseId, data);
 
-  await sheetAppend('cases!A:N', row);
-  return caseId;
+    const ap = await sheetAppendWithRow('cases!A:N', rowValues);
+    const row = ap.ok ? ap.row : null;
+
+    caseStore.set(waId, { caseId, row, data });
+    return { ok: ap.ok, caseId, row };
+  }
+
+  const nextData = { ...cur.data, ...patch };
+  const rowValues = buildCaseRow(waId, cur.caseId, nextData);
+
+  if (cur.row) {
+    await sheetUpdate(`cases!A${cur.row}:N${cur.row}`, rowValues);
+  } else {
+    // fallback: si no tenemos row (reinicios), append como plan B
+    const ap = await sheetAppendWithRow('cases!A:N', rowValues);
+    if (ap.ok && ap.row) cur.row = ap.row;
+  }
+
+  caseStore.set(waId, { ...cur, data: nextData });
+  return { ok: true, caseId: cur.caseId, row: cur.row };
 }
 
 async function logEvent(waId, caseId, eventType, payloadPreview, payloadObj) {
@@ -292,12 +370,14 @@ async function createMpPreference({ caseId, waId, label, patientType, osName, os
   const expiresTo = new Date(Date.now() + PAYMENT_WINDOW_MS);
 
   const payload = {
-    items: [{
-      title: `Seña - CEPA (${label || 'Turno'})`,
-      quantity: 1,
-      currency_id: 'ARS',
-      unit_price: Number(amount),
-    }],
+    items: [
+      {
+        title: `Seña - CEPA (${label || 'Turno'})`,
+        quantity: 1,
+        currency_id: 'ARS',
+        unit_price: Number(amount),
+      },
+    ],
     external_reference: caseId,
     expires: true,
     expiration_date_from: expiresFrom.toISOString(),
@@ -328,7 +408,9 @@ async function createMpPreference({ caseId, waId, label, patientType, osName, os
 
   if (!resp.ok) {
     let j = {};
-    try { j = await resp.json(); } catch {}
+    try {
+      j = await resp.json();
+    } catch {}
     log('error', 'mp_preference_failed', { status: resp.status, err: j });
     return { ok: false, status: resp.status, err: j };
   }
@@ -349,8 +431,18 @@ const CEPA = {
 };
 
 const OBRAS_SOCIALES_TOP = [
-  'OSDE', 'Swiss Medical', 'Galeno', 'Medifé', 'OMINT', 'SanCor Salud', 'Prevención Salud',
-  'Jerárquicos Salud', 'Andes Salud', 'Nobis', 'Federada Salud', 'Medicus'
+  'OSDE',
+  'Swiss Medical',
+  'Galeno',
+  'Medifé',
+  'OMINT',
+  'SanCor Salud',
+  'Prevención Salud',
+  'Jerárquicos Salud',
+  'Andes Salud',
+  'Nobis',
+  'Federada Salud',
+  'Medicus',
 ];
 
 function menuText() {
@@ -446,34 +538,43 @@ setInterval(() => {
   }
 }, 60 * 1000).unref();
 
+// ========== Dedupe Meta retries ==========
+const seenMsg = new Map(); // msgId -> ts
+const SEEN_TTL_MS = 10 * 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, ts] of seenMsg.entries()) {
+    if (!ts || now - ts > SEEN_TTL_MS) seenMsg.delete(id);
+  }
+}, 60 * 1000).unref();
+
 // ========== Core Flow (STATE-FIRST) ==========
 async function handleUserText(waId, rawText) {
   const raw = String(rawText || '').trim();
-  const firstLine = raw.split('\n').map(s => s.trim()).filter(Boolean)[0] || raw;
+  const firstLine = raw.split('\n').map((s) => s.trim()).filter(Boolean)[0] || raw;
   const norm = normalize(firstLine);
 
   const s = getSession(waId);
-  const caseId = await ensureCaseId(waId);
+  const caseId = await getOrCreateCaseId(waId);
 
-  // -------- STATE-FIRST (para que NO lo pisen atajos) --------
+  // -------- STATE-FIRST --------
   if (s.state === 'awaiting_mrturno_done') {
     if (norm === 'listo' || norm === 'ok' || norm === 'dale' || norm === 'ya') {
       setSession(waId, 'ask_patient_type', { flow: s.ctx.flow, label: s.ctx.label });
-      await writeCaseRow(waId, { flow_type: s.ctx.flow, service_label: s.ctx.label, status: 'awaiting_patient_type', last_message: raw.slice(0,160) });
+      await upsertCase(waId, { flow_type: s.ctx.flow, service_label: s.ctx.label, status: 'awaiting_patient_type', last_message: raw.slice(0, 160) });
       await logEvent(waId, caseId, 'state', 'ask_patient_type', { from: s.state });
       return sendText(waId, patientTypePrompt());
     }
-    await writeCaseRow(waId, { flow_type: s.ctx.flow, service_label: s.ctx.label, status: 'awaiting_mrturno', last_message: raw.slice(0,160) });
+    await upsertCase(waId, { flow_type: s.ctx.flow, service_label: s.ctx.label, status: 'awaiting_mrturno', last_message: raw.slice(0, 160) });
     return sendText(waId, `Cuando tengas el turno en MrTurno, escribime “LISTO” ✅`);
   }
 
   if (s.state === 'ask_patient_type') {
     if (norm === '1') {
-      // Particular => MP
       const flow = s.ctx.flow || 'turno';
       const label = s.ctx.label || 'Turno';
 
-      await writeCaseRow(waId, { flow_type: flow, patient_type: 'particular', service_label: label, status: 'awaiting_payment', last_message: raw.slice(0,160) });
+      await upsertCase(waId, { flow_type: flow, patient_type: 'particular', service_label: label, status: 'awaiting_payment', last_message: raw.slice(0, 160) });
 
       const mp = await createMpPreference({
         caseId,
@@ -485,12 +586,12 @@ async function handleUserText(waId, rawText) {
 
       if (!mp.ok) {
         setSession(waId, 'handoff', {});
-        await writeCaseRow(waId, { flow_type: flow, patient_type: 'particular', service_label: label, status: 'mp_failed', last_message: 'mp_failed' });
+        await upsertCase(waId, { flow_type: flow, patient_type: 'particular', service_label: label, status: 'mp_failed', last_message: 'mp_failed' });
         return sendText(waId, `Ahora mismo no pude generar el link. Escribí “recepción” y te lo resuelven ✅`);
       }
 
       setSession(waId, 'awaiting_payment', { flow, label, patientType: 'particular', mpLink: mp.init_point });
-      await writeCaseRow(waId, { flow_type: flow, patient_type: 'particular', service_label: label, payment_link: mp.init_point, status: 'awaiting_payment', last_message: 'mp_link_sent' });
+      await upsertCase(waId, { flow_type: flow, patient_type: 'particular', service_label: label, payment_link: mp.init_point, status: 'awaiting_payment', last_message: 'mp_link_sent' });
       await logEvent(waId, caseId, 'mp_link', 'mp_link_created', mp);
 
       return sendText(waId, paymentLinkText(mp.init_point));
@@ -498,7 +599,7 @@ async function handleUserText(waId, rawText) {
 
     if (norm === '2') {
       setSession(waId, 'ask_os_name', { flow: s.ctx.flow, label: s.ctx.label, patientType: 'obra_social' });
-      await writeCaseRow(waId, { flow_type: s.ctx.flow, patient_type: 'obra_social', service_label: s.ctx.label, status: 'awaiting_os_name', last_message: raw.slice(0,160) });
+      await upsertCase(waId, { flow_type: s.ctx.flow, patient_type: 'obra_social', service_label: s.ctx.label, status: 'awaiting_os_name', last_message: raw.slice(0, 160) });
       return sendText(waId, askOsNameText());
     }
 
@@ -506,13 +607,12 @@ async function handleUserText(waId, rawText) {
   }
 
   if (s.state === 'ask_os_name') {
-    // Evitar que un número se guarde como obra social
     if (/^\d{6,}$/.test(raw)) {
       return sendText(waId, 'Decime el *nombre* de tu obra social (ej: OSDE, Swiss Medical, Galeno).');
     }
 
     setSession(waId, 'ask_os_token', { ...s.ctx, osName: raw.trim() });
-    await writeCaseRow(waId, { flow_type: s.ctx.flow, patient_type: 'obra_social', os_name: raw.trim(), service_label: s.ctx.label, status: 'awaiting_os_token', last_message: raw.slice(0,160) });
+    await upsertCase(waId, { flow_type: s.ctx.flow, patient_type: 'obra_social', os_name: raw.trim(), service_label: s.ctx.label, status: 'awaiting_os_token', last_message: raw.slice(0, 160) });
     return sendText(waId, askOsTokenText());
   }
 
@@ -522,7 +622,7 @@ async function handleUserText(waId, rawText) {
     const osName = s.ctx.osName || '';
     const osToken = raw.trim();
 
-    await writeCaseRow(waId, { flow_type: flow, patient_type: 'obra_social', os_name: osName, os_token: osToken, service_label: label, status: 'awaiting_payment', last_message: raw.slice(0,160) });
+    await upsertCase(waId, { flow_type: flow, patient_type: 'obra_social', os_name: osName, os_token: osToken, service_label: label, status: 'awaiting_payment', last_message: raw.slice(0, 160) });
     await logEvent(waId, caseId, 'os_data', 'os_token_received', { osName, osToken });
 
     const mp = await createMpPreference({
@@ -537,12 +637,12 @@ async function handleUserText(waId, rawText) {
 
     if (!mp.ok) {
       setSession(waId, 'handoff', {});
-      await writeCaseRow(waId, { flow_type: flow, patient_type: 'obra_social', os_name: osName, os_token: osToken, service_label: label, status: 'mp_failed', last_message: 'mp_failed' });
+      await upsertCase(waId, { flow_type: flow, patient_type: 'obra_social', os_name: osName, os_token: osToken, service_label: label, status: 'mp_failed', last_message: 'mp_failed' });
       return sendText(waId, `Listo ✅ Tomé tus datos.\nAhora no pude generar el link.\nEscribí “recepción” y te lo hacen manual.`);
     }
 
     setSession(waId, 'awaiting_payment', { flow, label, patientType: 'obra_social', osName, osToken, mpLink: mp.init_point });
-    await writeCaseRow(waId, { flow_type: flow, patient_type: 'obra_social', os_name: osName, os_token: osToken, service_label: label, payment_link: mp.init_point, status: 'awaiting_payment', last_message: 'mp_link_sent' });
+    await upsertCase(waId, { flow_type: flow, patient_type: 'obra_social', os_name: osName, os_token: osToken, service_label: label, payment_link: mp.init_point, status: 'awaiting_payment', last_message: 'mp_link_sent' });
     await logEvent(waId, caseId, 'mp_link', 'mp_link_created', mp);
 
     return sendText(waId, paymentLinkText(mp.init_point));
@@ -554,7 +654,7 @@ async function handleUserText(waId, rawText) {
       const receiptId = makeId('CEPA');
       resetSession(waId);
 
-      await writeCaseRow(waId, {
+      await upsertCase(waId, {
         flow_type: s.ctx.flow,
         patient_type: s.ctx.patientType,
         os_name: s.ctx.osName || '',
@@ -564,7 +664,7 @@ async function handleUserText(waId, rawText) {
         payment_link: s.ctx.mpLink || '',
         payment_op_id: opId,
         status: 'confirmed',
-        last_message: raw.slice(0,160),
+        last_message: raw.slice(0, 160),
       });
 
       await logEvent(waId, caseId, 'receipt', `receipt=${receiptId} op=${opId}`, { receiptId, opId });
@@ -572,22 +672,21 @@ async function handleUserText(waId, rawText) {
       return sendText(waId, finalConfirmedText(receiptId));
     }
 
-    await writeCaseRow(waId, { status: 'awaiting_payment', last_message: raw.slice(0,160) });
+    await upsertCase(waId, { status: 'awaiting_payment', last_message: raw.slice(0, 160) });
     return sendText(waId, `Cuando pagues, mandame el *ID de operación* (ej: “ID 123456789”) o una *captura* ✅`);
   }
 
-  // -------- Atajos (SOLO cuando estás en menú) --------
+  // -------- Atajos SOLO en menú --------
   if (s.state === 'menu') {
-    // Menu global
     if (norm === '0' || norm === 'menu' || norm === 'menú' || norm === 'inicio') {
       resetSession(waId);
-      await writeCaseRow(waId, { status: 'menu', last_message: raw.slice(0,160) });
+      await upsertCase(waId, { status: 'menu', last_message: raw.slice(0, 160) });
       return sendText(waId, menuText());
     }
 
-    // Atajo OS / prepagas SOLO en menú (✅ FIX repeticiones)
+    // atajo OS/prepagas solo en menu
     if (norm.includes('obra') || norm.includes('prepaga') || norm.includes('osde') || norm.includes('swiss')) {
-      await writeCaseRow(waId, { status: 'info_os', last_message: raw.slice(0,160) });
+      await upsertCase(waId, { status: 'info_os', last_message: raw.slice(0, 160) });
       return sendText(
         waId,
         `Trabajamos con varias obras sociales/prepagas. Algunas frecuentes:\n• ${OBRAS_SOCIALES_TOP.join('\n• ')}\n\nSi me decís cuál tenés, te confirmo si está.`
@@ -596,18 +695,18 @@ async function handleUserText(waId, rawText) {
 
     if (norm === '1') {
       setSession(waId, 'awaiting_mrturno_done', { flow: 'turno', label: 'Turno' });
-      await writeCaseRow(waId, { flow_type: 'turno', service_label: 'Turno', status: 'awaiting_mrturno', last_message: raw.slice(0,160) });
+      await upsertCase(waId, { flow_type: 'turno', service_label: 'Turno', status: 'awaiting_mrturno', last_message: raw.slice(0, 160) });
       return sendText(waId, mrTurnoText('Perfecto ✅'));
     }
 
     if (norm === '2') {
       setSession(waId, 'awaiting_mrturno_done', { flow: 'estudio', label: 'Estudios' });
-      await writeCaseRow(waId, { flow_type: 'estudio', service_label: 'Estudios', status: 'awaiting_mrturno', last_message: raw.slice(0,160) });
+      await upsertCase(waId, { flow_type: 'estudio', service_label: 'Estudios', status: 'awaiting_mrturno', last_message: raw.slice(0, 160) });
       return sendText(waId, mrTurnoText('Perfecto ✅'));
     }
 
     if (norm === '3') {
-      await writeCaseRow(waId, { status: 'info_os', last_message: raw.slice(0,160) });
+      await upsertCase(waId, { status: 'info_os', last_message: raw.slice(0, 160) });
       return sendText(
         waId,
         `Trabajamos con varias obras sociales/prepagas. Algunas frecuentes:\n• ${OBRAS_SOCIALES_TOP.join('\n• ')}\n\nSi me decís cuál tenés, te confirmo si está.`
@@ -615,23 +714,23 @@ async function handleUserText(waId, rawText) {
     }
 
     if (norm === '4') {
-      await writeCaseRow(waId, { status: 'info_contacto', last_message: raw.slice(0,160) });
+      await upsertCase(waId, { status: 'info_contacto', last_message: raw.slice(0, 160) });
       return sendText(waId, infoContacto());
     }
 
     if (norm === '5' || norm.includes('recep') || norm.includes('humano')) {
       setSession(waId, 'handoff', {});
-      await writeCaseRow(waId, { status: 'handoff', last_message: raw.slice(0,160) });
+      await upsertCase(waId, { status: 'handoff', last_message: raw.slice(0, 160) });
       return sendText(waId, `Listo ✅ Te paso con recepción.\nContame en 1 línea qué necesitás (especialidad/estudio + día preferido).`);
     }
 
-    await writeCaseRow(waId, { status: 'menu', last_message: raw.slice(0,160) });
+    await upsertCase(waId, { status: 'menu', last_message: raw.slice(0, 160) });
     return sendText(waId, menuText());
   }
 
   // fallback total
   resetSession(waId);
-  await writeCaseRow(waId, { status: 'fallback', last_message: raw.slice(0,160) });
+  await upsertCase(waId, { status: 'fallback', last_message: raw.slice(0, 160) });
   return sendText(waId, menuText());
 }
 
@@ -693,10 +792,19 @@ async function postHandler(req, res) {
     const msg = value?.messages?.[0];
     if (!msg) return;
 
+    const msgId = msg.id;
+    if (msgId) {
+      if (seenMsg.has(msgId)) {
+        log('info', 'wa_dedup_ignored', { msgId });
+        return;
+      }
+      seenMsg.set(msgId, Date.now());
+    }
+
     const from = msg.from;
     const text = msg?.text?.body ? String(msg.text.body) : '';
 
-    log('info', 'wa_inbound', { from, msgId: msg.id, text_preview: text.slice(0, 140) });
+    log('info', 'wa_inbound', { from, msgId, text_preview: text.slice(0, 140) });
 
     const hasMedia =
       !!msg?.image ||
@@ -706,13 +814,15 @@ async function postHandler(req, res) {
       !!msg?.sticker;
 
     if (hasMedia) {
-      // si está esperando pago, con media confirmamos igual (sin op id)
       const s = getSession(from);
+      const caseId = await getOrCreateCaseId(from);
+
+      // si está esperando pago, con media confirmamos igual (sin op id)
       if (s.state === 'awaiting_payment') {
         const receiptId = makeId('CEPA');
         resetSession(from);
 
-        await writeCaseRow(from, {
+        await upsertCase(from, {
           flow_type: s.ctx.flow,
           patient_type: s.ctx.patientType,
           os_name: s.ctx.osName || '',
@@ -725,11 +835,13 @@ async function postHandler(req, res) {
           last_message: 'media_proof',
         });
 
+        await logEvent(from, caseId, 'receipt_media', `receipt=${receiptId}`, { receiptId });
         await sendText(from, receiptAckText(receiptId));
         await sendText(from, finalConfirmedText(receiptId));
         return;
       }
 
+      await upsertCase(from, { status: 'media_received', last_message: 'media' });
       return sendText(from, `Recibido ✅\n\n${menuText()}`);
     }
 
@@ -742,7 +854,10 @@ async function postHandler(req, res) {
 }
 
 // ========== Routes ==========
-app.get('/health', (_req, res) => res.status(200).json({ ok: true, uptime_s: Math.floor((Date.now() - STARTED_AT) / 1000) }));
+app.get('/health', (_req, res) =>
+  res.status(200).json({ ok: true, uptime_s: Math.floor((Date.now() - STARTED_AT) / 1000) })
+);
+
 app.get('/privacidad', (_req, res) => {
   res.status(200).send(
     `<html><head><meta charset="utf-8"><title>Privacidad</title></head>
@@ -763,7 +878,11 @@ app.post('/webhook', express.raw({ type: '*/*', limit: '2mb' }), postHandler);
 const port = Number(PORT);
 app.listen(port, '0.0.0.0', () => {
   const hasGsheet = !!SPREADSHEET_ID && (!!GSHEET_SA_JSON_BASE64 || (!!GSHEET_CLIENT_EMAIL && !!GSHEET_PRIVATE_KEY));
-  log('info', 'gsheet_ready', { has_gsheet: hasGsheet, has_sheet_id: !!SPREADSHEET_ID, sheet_id_preview: SPREADSHEET_ID ? String(SPREADSHEET_ID).slice(0, 8) + '...' : null });
+  log('info', 'gsheet_ready', {
+    has_gsheet: hasGsheet,
+    has_sheet_id: !!SPREADSHEET_ID,
+    sheet_id_preview: SPREADSHEET_ID ? String(SPREADSHEET_ID).slice(0, 8) + '...' : null,
+  });
 
   log('info', 'server_started', {
     port,
