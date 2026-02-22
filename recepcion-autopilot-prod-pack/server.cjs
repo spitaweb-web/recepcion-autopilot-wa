@@ -2,15 +2,15 @@
 
 /**
  * CEPA Recepción Autopilot — WhatsApp Cloud API — Node/Express
- * + Google Sheets (cases A:N update 1 fila por caso, events A:G append histórico)
+ * + Google Sheets: cases (UPDATE por wa_from) + events (APPEND)
  * + MercadoPago seña (preference init_point)
  *
- * Fixes:
- * ✅ GSHEET_ID alias (Render usa GSHEET_ID)
+ * Fix PRO:
+ * ✅ UPSERT cases por wa_from (col C) => NO duplica al reiniciar Render
+ * ✅ events siempre APPEND (auditoría)
  * ✅ State-first: no pisa ask_os_name/ask_os_token con atajos
  * ✅ Atajo OSDE/obra social SOLO en menu
- * ✅ cases = UPDATE (1 fila) / events = APPEND (histórico)
- * ✅ Logs gsheet_ready + gsheet_append + gsheet_update
+ * ✅ Logs: gsheet_ready + gsheet_update + gsheet_append
  */
 
 const express = require('express');
@@ -34,6 +34,7 @@ app.use(
   })
 );
 
+// ================= ENV =================
 const {
   PORT = '3000',
   WA_VERIFY_TOKEN,
@@ -52,7 +53,10 @@ const {
   MP_FAILURE_URL,
   MP_PENDING_URL,
 
-  // Google Sheets (Render suele tener GSHEET_ID)
+  // MrTurno override opcional
+  MR_TURNO_URL,
+
+  // Google Sheets (Render suele usar GSHEET_ID)
   GSHEET_SPREADSHEET_ID,
   GSHEET_ID,
   GSHEET_SA_JSON_BASE64,
@@ -60,10 +64,11 @@ const {
   GSHEET_PRIVATE_KEY,
 } = process.env;
 
-const SPREADSHEET_ID = GSHEET_SPREADSHEET_ID || GSHEET_ID; // ✅ alias
+const SPREADSHEET_ID = GSHEET_SPREADSHEET_ID || GSHEET_ID;
+
 const STARTED_AT = Date.now();
 
-// ========== Util ==========
+// ================= Util =================
 function timingSafeEq(a, b) {
   const ba = Buffer.from(String(a));
   const bb = Buffer.from(String(b));
@@ -86,7 +91,7 @@ function normalize(s) {
 }
 
 function verifyMetaSignature(rawBodyBuffer, signatureHeader, appSecret) {
-  if (!appSecret) return true;
+  if (!appSecret) return true; // permitido, pero no ideal
   if (!signatureHeader || typeof signatureHeader !== 'string') return false;
   if (!signatureHeader.startsWith('sha256=')) return false;
 
@@ -108,11 +113,8 @@ function makeId(prefix = 'ID') {
 }
 
 function moneyARS(n) {
-  try {
-    return new Intl.NumberFormat('es-AR').format(n);
-  } catch {
-    return String(n);
-  }
+  try { return new Intl.NumberFormat('es-AR').format(n); }
+  catch { return String(n); }
 }
 
 function extractOpId(text) {
@@ -151,9 +153,7 @@ async function sendText(toWaId, text) {
 
   if (!resp.ok) {
     let j = {};
-    try {
-      j = await resp.json();
-    } catch {}
+    try { j = await resp.json(); } catch {}
     log('error', 'wa_outbound_failed', { status: resp.status, err: j });
     return { ok: false, status: resp.status, err: j };
   }
@@ -175,7 +175,14 @@ const PAYMENT_WINDOW_MS = (() => {
   return safe * 60 * 1000;
 })();
 
-// ========== Google Sheets ==========
+// ================= Google Sheets (UPSERT cases) =================
+const SHEET_CASES = 'cases';
+const SHEET_EVENTS = 'events';
+
+// cases A:N
+// A created_at, B case_id, C wa_from, D flow_type, E patient_type, F os_name, G os_token, H service_label,
+// I deposit_amount, J payment_link, K payment_op_id, L status, M last_message, N updated_at
+
 function getServiceAccount() {
   if (GSHEET_SA_JSON_BASE64) {
     const raw = Buffer.from(GSHEET_SA_JSON_BASE64, 'base64').toString('utf8');
@@ -190,59 +197,43 @@ function getServiceAccount() {
   return null;
 }
 
+let sheetsClientPromise = null;
 async function getSheetsClient() {
-  const sa = getServiceAccount();
-  if (!sa || !SPREADSHEET_ID) return null;
+  if (sheetsClientPromise) return sheetsClientPromise;
 
-  const auth = new google.auth.JWT({
-    email: sa.client_email,
-    key: sa.private_key,
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-  });
+  sheetsClientPromise = (async () => {
+    const sa = getServiceAccount();
+    if (!sa || !SPREADSHEET_ID) return null;
 
-  return google.sheets({ version: 'v4', auth });
-}
-
-function parseRowFromUpdatedRange(updatedRange) {
-  // ej: "cases!A12:N12" => 12
-  const m = String(updatedRange || '').match(/![A-Z]+(\d+):[A-Z]+(\d+)/);
-  if (!m) return null;
-  return Number(m[1]) || null;
-}
-
-async function sheetAppendWithRow(range, values) {
-  try {
-    const sheets = await getSheetsClient();
-    if (!sheets) return { ok: false, reason: 'missing_gsheet_env' };
-
-    log('info', 'gsheet_append', { range });
-
-    const resp = await sheets.spreadsheets.values.append({
-      spreadsheetId: SPREADSHEET_ID,
-      range,
-      valueInputOption: 'RAW',
-      insertDataOption: 'INSERT_ROWS',
-      requestBody: { values: [values] },
+    const auth = new google.auth.JWT({
+      email: sa.client_email,
+      key: sa.private_key,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
     });
 
-    const updatedRange = resp?.data?.updates?.updatedRange;
-    const row = parseRowFromUpdatedRange(updatedRange);
-    return { ok: true, row, updatedRange };
-  } catch (e) {
-    log('error', 'gsheet_append_failed', { err: String(e?.message || e), range });
-    return { ok: false, reason: 'append_failed' };
-  }
+    return google.sheets({ version: 'v4', auth });
+  })();
+
+  return sheetsClientPromise;
+}
+
+async function sheetGet(range) {
+  const sheets = await getSheetsClient();
+  if (!sheets) return { ok: false, reason: 'missing_gsheet_env' };
+  const r = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range,
+  });
+  return { ok: true, values: r.data.values || [] };
 }
 
 async function sheetAppend(range, values) {
-  // simple append (events)
   try {
     const sheets = await getSheetsClient();
     if (!sheets) return { ok: false, reason: 'missing_gsheet_env' };
 
     log('info', 'gsheet_append', { range });
-
-    await sheets.spreadsheets.values.append({
+    const r = await sheets.spreadsheets.values.append({
       spreadsheetId: SPREADSHEET_ID,
       range,
       valueInputOption: 'RAW',
@@ -250,18 +241,20 @@ async function sheetAppend(range, values) {
       requestBody: { values: [values] },
     });
 
-    return { ok: true };
+    const updatedRange = r?.data?.updates?.updatedRange || '';
+    return { ok: true, updatedRange };
   } catch (e) {
     log('error', 'gsheet_append_failed', { err: String(e?.message || e), range });
     return { ok: false, reason: 'append_failed' };
   }
 }
 
-async function sheetUpdate(range, values) {
+async function sheetUpdateRow(rowNumber, values) {
   try {
     const sheets = await getSheetsClient();
     if (!sheets) return { ok: false, reason: 'missing_gsheet_env' };
 
+    const range = `${SHEET_CASES}!A${rowNumber}:N${rowNumber}`;
     log('info', 'gsheet_update', { range });
 
     await sheets.spreadsheets.values.update({
@@ -273,85 +266,153 @@ async function sheetUpdate(range, values) {
 
     return { ok: true };
   } catch (e) {
-    log('error', 'gsheet_update_failed', { err: String(e?.message || e), range });
+    log('error', 'gsheet_update_failed', { err: String(e?.message || e), rowNumber });
     return { ok: false, reason: 'update_failed' };
   }
 }
 
-// Schema EXACTO:
-// cases A:N = created_at, case_id, wa_from, flow_type, patient_type, os_name, os_token, service_label,
-//             deposit_amount, payment_link, payment_op_id, status, last_message, updated_at
-// events A:G = event_id, created_at, case_id, wa_from, event_type, payload_preview, payload
-
-const caseStore = new Map(); // waId -> { caseId, row, data }
-
-function buildCaseRow(waId, caseId, data) {
-  return [
-    data.created_at || nowISO(), // A created_at
-    caseId, // B case_id
-    waId, // C wa_from
-    data.flow_type || 'whatsapp', // D flow_type
-    data.patient_type || '', // E patient_type
-    data.os_name || '', // F os_name
-    data.os_token || '', // G os_token
-    data.service_label || '', // H service_label
-    data.deposit_amount ?? (DEPOSIT_ON ? String(DEPOSIT_VALUE) : ''), // I deposit_amount
-    data.payment_link || '', // J payment_link
-    data.payment_op_id || '', // K payment_op_id
-    data.status || 'lead', // L status
-    data.last_message || '', // M last_message
-    nowISO(), // N updated_at
-  ];
+function normalizeRowLen(arr, len) {
+  const v = Array.isArray(arr) ? [...arr] : [];
+  while (v.length < len) v.push('');
+  return v.slice(0, len);
 }
 
-async function getOrCreateCaseId(waId) {
-  const cur = caseStore.get(waId);
-  if (cur?.caseId) return cur.caseId;
+function rowToCaseObj(row) {
+  const v = normalizeRowLen(row, 14);
+  return {
+    created_at: v[0] || '',
+    case_id: v[1] || '',
+    wa_from: v[2] || '',
+    flow_type: v[3] || 'whatsapp',
+    patient_type: v[4] || '',
+    os_name: v[5] || '',
+    os_token: v[6] || '',
+    service_label: v[7] || '',
+    deposit_amount: v[8] || '',
+    payment_link: v[9] || '',
+    payment_op_id: v[10] || '',
+    status: v[11] || 'lead',
+    last_message: v[12] || '',
+    updated_at: v[13] || '',
+  };
+}
 
+function caseObjToRow(c) {
+  return normalizeRowLen([
+    c.created_at,
+    c.case_id,
+    c.wa_from,
+    c.flow_type,
+    c.patient_type,
+    c.os_name,
+    c.os_token,
+    c.service_label,
+    c.deposit_amount,
+    c.payment_link,
+    c.payment_op_id,
+    c.status,
+    c.last_message,
+    c.updated_at,
+  ], 14);
+}
+
+// Cache: waId -> { rowNumber, caseObj }
+const caseCache = new Map();
+
+async function findCaseRowByWa(waId) {
+  // Leemos B:C para encontrar row + case_id sin traer todo el sheet
+  const r = await sheetGet(`${SHEET_CASES}!B:C`);
+  if (!r.ok) return null;
+
+  const values = r.values || [];
+  // values[0] es header si existe
+  for (let i = 1; i < values.length; i++) {
+    const row = values[i] || [];
+    const caseId = row[0] || ''; // col B
+    const wa = row[1] || '';     // col C
+    if (String(wa) === String(waId)) {
+      const rowNumber = i + 1; // porque i=1 => row 2
+      return { rowNumber, caseId };
+    }
+  }
+  return null;
+}
+
+async function loadCaseFromSheet(rowNumber) {
+  const r = await sheetGet(`${SHEET_CASES}!A${rowNumber}:N${rowNumber}`);
+  if (!r.ok) return null;
+  const row = (r.values && r.values[0]) ? r.values[0] : [];
+  return rowToCaseObj(row);
+}
+
+async function ensureCase(waId) {
+  // 1) cache
+  if (caseCache.has(waId)) return caseCache.get(waId);
+
+  // 2) buscar existente por wa_from
+  const found = await findCaseRowByWa(waId);
+  if (found) {
+    const caseObj = await loadCaseFromSheet(found.rowNumber);
+    if (caseObj && caseObj.case_id) {
+      const pack = { rowNumber: found.rowNumber, caseObj };
+      caseCache.set(waId, pack);
+      return pack;
+    }
+  }
+
+  // 3) crear nuevo caso (append) y luego resolvemos rowNumber por búsqueda inmediata
   const caseId = makeId('CASE');
-  const created_at = nowISO();
-  const data = { created_at, status: 'lead' };
-  const rowValues = buildCaseRow(waId, caseId, data);
+  const now = nowISO();
 
-  const ap = await sheetAppendWithRow('cases!A:N', rowValues);
-  const row = ap.ok ? ap.row : null;
+  const newCase = {
+    created_at: now,
+    case_id: caseId,
+    wa_from: waId,
+    flow_type: 'whatsapp',
+    patient_type: '',
+    os_name: '',
+    os_token: '',
+    service_label: '',
+    deposit_amount: DEPOSIT_ON ? String(DEPOSIT_VALUE) : '',
+    payment_link: '',
+    payment_op_id: '',
+    status: 'lead',
+    last_message: '',
+    updated_at: now,
+  };
 
-  caseStore.set(waId, { caseId, row, data });
-  return caseId;
+  await sheetAppend(`${SHEET_CASES}!A:N`, caseObjToRow(newCase));
+
+  // buscar row recién creado (simple y robusto)
+  const foundAfter = await findCaseRowByWa(waId);
+  const rowNumber = foundAfter ? foundAfter.rowNumber : 2;
+
+  const pack = { rowNumber, caseObj: newCase };
+  caseCache.set(waId, pack);
+  return pack;
 }
 
-async function upsertCase(waId, patch = {}) {
-  const cur = caseStore.get(waId);
+async function upsertCase(waId, patch) {
+  const pack = await ensureCase(waId);
+  const prev = pack.caseObj;
 
-  if (!cur) {
-    const caseId = makeId('CASE');
-    const data = { created_at: nowISO(), ...patch };
-    const rowValues = buildCaseRow(waId, caseId, data);
+  const next = {
+    ...prev,
+    ...patch,
+    created_at: prev.created_at || nowISO(),
+    case_id: prev.case_id,
+    wa_from: prev.wa_from,
+    updated_at: nowISO(),
+  };
 
-    const ap = await sheetAppendWithRow('cases!A:N', rowValues);
-    const row = ap.ok ? ap.row : null;
-
-    caseStore.set(waId, { caseId, row, data });
-    return { ok: ap.ok, caseId, row };
-  }
-
-  const nextData = { ...cur.data, ...patch };
-  const rowValues = buildCaseRow(waId, cur.caseId, nextData);
-
-  if (cur.row) {
-    await sheetUpdate(`cases!A${cur.row}:N${cur.row}`, rowValues);
-  } else {
-    // fallback: si no tenemos row (reinicios), append como plan B
-    const ap = await sheetAppendWithRow('cases!A:N', rowValues);
-    if (ap.ok && ap.row) cur.row = ap.row;
-  }
-
-  caseStore.set(waId, { ...cur, data: nextData });
-  return { ok: true, caseId: cur.caseId, row: cur.row };
+  await sheetUpdateRow(pack.rowNumber, caseObjToRow(next));
+  pack.caseObj = next;
+  caseCache.set(waId, pack);
+  return next;
 }
 
-async function logEvent(waId, caseId, eventType, payloadPreview, payloadObj) {
-  await sheetAppend('events!A:G', [
+async function appendEvent(waId, caseId, eventType, payloadPreview, payloadObj) {
+  const row = [
     makeId('EV'),
     nowISO(),
     caseId || '',
@@ -359,10 +420,11 @@ async function logEvent(waId, caseId, eventType, payloadPreview, payloadObj) {
     eventType || '',
     String(payloadPreview || '').slice(0, 220),
     payloadObj ? JSON.stringify(payloadObj).slice(0, 45000) : '',
-  ]);
+  ];
+  await sheetAppend(`${SHEET_EVENTS}!A:G`, row);
 }
 
-// ========== MercadoPago ==========
+// ================= MercadoPago =================
 async function createMpPreference({ caseId, waId, label, patientType, osName, osToken, amount }) {
   if (!MP_ACCESS_TOKEN) return { ok: false, reason: 'missing_mp_token' };
 
@@ -370,14 +432,12 @@ async function createMpPreference({ caseId, waId, label, patientType, osName, os
   const expiresTo = new Date(Date.now() + PAYMENT_WINDOW_MS);
 
   const payload = {
-    items: [
-      {
-        title: `Seña - CEPA (${label || 'Turno'})`,
-        quantity: 1,
-        currency_id: 'ARS',
-        unit_price: Number(amount),
-      },
-    ],
+    items: [{
+      title: `Seña - CEPA (${label || 'Turno'})`,
+      quantity: 1,
+      currency_id: 'ARS',
+      unit_price: Number(amount),
+    }],
     external_reference: caseId,
     expires: true,
     expiration_date_from: expiresFrom.toISOString(),
@@ -408,9 +468,7 @@ async function createMpPreference({ caseId, waId, label, patientType, osName, os
 
   if (!resp.ok) {
     let j = {};
-    try {
-      j = await resp.json();
-    } catch {}
+    try { j = await resp.json(); } catch {}
     log('error', 'mp_preference_failed', { status: resp.status, err: j });
     return { ok: false, status: resp.status, err: j };
   }
@@ -419,30 +477,20 @@ async function createMpPreference({ caseId, waId, label, patientType, osName, os
   return { ok: true, init_point: data.init_point, pref_id: data.id };
 }
 
-// ========== Data + Copy ==========
+// ================= Data + Copy =================
 const CEPA = {
   name: 'CEPA Consultorios (Luján de Cuyo)',
   address: 'Constitución 46, Luján de Cuyo, Mendoza',
   hours: 'Lunes a sábados · 07:30 a 21:00',
   email: 'cepadiagnosticomedicointegral@gmail.com',
   phone: '261-4987007',
-  mrturno: 'https://www.mrturno.com/m/@cepa',
+  mrturno: MR_TURNO_URL || 'https://www.mrturno.com/m/@cepa',
   disclaimer: 'Si es una urgencia, no uses este chat: llamá al 107 o acudí a guardia.',
 };
 
 const OBRAS_SOCIALES_TOP = [
-  'OSDE',
-  'Swiss Medical',
-  'Galeno',
-  'Medifé',
-  'OMINT',
-  'SanCor Salud',
-  'Prevención Salud',
-  'Jerárquicos Salud',
-  'Andes Salud',
-  'Nobis',
-  'Federada Salud',
-  'Medicus',
+  'OSDE', 'Swiss Medical', 'Galeno', 'Medifé', 'OMINT', 'SanCor Salud', 'Prevención Salud',
+  'Jerárquicos Salud', 'Andes Salud', 'Nobis', 'Federada Salud', 'Medicus'
 ];
 
 function menuText() {
@@ -514,7 +562,7 @@ ${infoContacto()}
 Si necesitás reprogramar, escribí “recepción”.`;
 }
 
-// ========== Sessions ==========
+// ================= Sessions =================
 const sessions = new Map(); // waId -> { state, ctx, updatedAt }
 const SESSION_TTL_MS = 60 * 60 * 1000;
 
@@ -538,7 +586,7 @@ setInterval(() => {
   }
 }, 60 * 1000).unref();
 
-// ========== Dedupe Meta retries ==========
+// ================= Dedupe msg.id =================
 const seenMsg = new Map(); // msgId -> ts
 const SEEN_TTL_MS = 10 * 60 * 1000;
 setInterval(() => {
@@ -548,24 +596,39 @@ setInterval(() => {
   }
 }, 60 * 1000).unref();
 
-// ========== Core Flow (STATE-FIRST) ==========
+// ================= Core Flow (STATE-FIRST) =================
 async function handleUserText(waId, rawText) {
   const raw = String(rawText || '').trim();
-  const firstLine = raw.split('\n').map((s) => s.trim()).filter(Boolean)[0] || raw;
+  const firstLine = raw.split('\n').map(s => s.trim()).filter(Boolean)[0] || raw;
   const norm = normalize(firstLine);
 
   const s = getSession(waId);
-  const caseId = await getOrCreateCaseId(waId);
+  const pack = await ensureCase(waId);
+  const caseId = pack.caseObj.case_id;
 
-  // -------- STATE-FIRST --------
+  // ---------- STATE-FIRST ----------
   if (s.state === 'awaiting_mrturno_done') {
-    if (norm === 'listo' || norm === 'ok' || norm === 'dale' || norm === 'ya') {
+    if (['listo','ok','dale','ya'].includes(norm)) {
       setSession(waId, 'ask_patient_type', { flow: s.ctx.flow, label: s.ctx.label });
-      await upsertCase(waId, { flow_type: s.ctx.flow, service_label: s.ctx.label, status: 'awaiting_patient_type', last_message: raw.slice(0, 160) });
-      await logEvent(waId, caseId, 'state', 'ask_patient_type', { from: s.state });
+
+      await upsertCase(waId, {
+        flow_type: s.ctx.flow,
+        service_label: s.ctx.label,
+        status: 'awaiting_patient_type',
+        last_message: raw.slice(0, 160),
+      });
+      await appendEvent(waId, caseId, 'state', 'ask_patient_type', { from: 'awaiting_mrturno_done' });
+
       return sendText(waId, patientTypePrompt());
     }
-    await upsertCase(waId, { flow_type: s.ctx.flow, service_label: s.ctx.label, status: 'awaiting_mrturno', last_message: raw.slice(0, 160) });
+
+    await upsertCase(waId, {
+      flow_type: s.ctx.flow,
+      service_label: s.ctx.label,
+      status: 'awaiting_mrturno',
+      last_message: raw.slice(0, 160),
+    });
+
     return sendText(waId, `Cuando tengas el turno en MrTurno, escribime “LISTO” ✅`);
   }
 
@@ -574,7 +637,13 @@ async function handleUserText(waId, rawText) {
       const flow = s.ctx.flow || 'turno';
       const label = s.ctx.label || 'Turno';
 
-      await upsertCase(waId, { flow_type: flow, patient_type: 'particular', service_label: label, status: 'awaiting_payment', last_message: raw.slice(0, 160) });
+      await upsertCase(waId, {
+        flow_type: flow,
+        patient_type: 'particular',
+        service_label: label,
+        status: 'awaiting_payment',
+        last_message: raw.slice(0, 160),
+      });
 
       const mp = await createMpPreference({
         caseId,
@@ -586,20 +655,34 @@ async function handleUserText(waId, rawText) {
 
       if (!mp.ok) {
         setSession(waId, 'handoff', {});
-        await upsertCase(waId, { flow_type: flow, patient_type: 'particular', service_label: label, status: 'mp_failed', last_message: 'mp_failed' });
+        await upsertCase(waId, { status: 'mp_failed', last_message: 'mp_failed' });
+        await appendEvent(waId, caseId, 'mp', 'mp_failed', mp);
         return sendText(waId, `Ahora mismo no pude generar el link. Escribí “recepción” y te lo resuelven ✅`);
       }
 
       setSession(waId, 'awaiting_payment', { flow, label, patientType: 'particular', mpLink: mp.init_point });
-      await upsertCase(waId, { flow_type: flow, patient_type: 'particular', service_label: label, payment_link: mp.init_point, status: 'awaiting_payment', last_message: 'mp_link_sent' });
-      await logEvent(waId, caseId, 'mp_link', 'mp_link_created', mp);
+      await upsertCase(waId, {
+        flow_type: flow,
+        patient_type: 'particular',
+        service_label: label,
+        payment_link: mp.init_point,
+        status: 'awaiting_payment',
+        last_message: 'mp_link_sent',
+      });
+      await appendEvent(waId, caseId, 'mp', 'mp_link_created', mp);
 
       return sendText(waId, paymentLinkText(mp.init_point));
     }
 
     if (norm === '2') {
       setSession(waId, 'ask_os_name', { flow: s.ctx.flow, label: s.ctx.label, patientType: 'obra_social' });
-      await upsertCase(waId, { flow_type: s.ctx.flow, patient_type: 'obra_social', service_label: s.ctx.label, status: 'awaiting_os_name', last_message: raw.slice(0, 160) });
+      await upsertCase(waId, {
+        flow_type: s.ctx.flow,
+        patient_type: 'obra_social',
+        service_label: s.ctx.label,
+        status: 'awaiting_os_name',
+        last_message: raw.slice(0, 160),
+      });
       return sendText(waId, askOsNameText());
     }
 
@@ -607,12 +690,22 @@ async function handleUserText(waId, rawText) {
   }
 
   if (s.state === 'ask_os_name') {
+    // Evitar que manden números y se guarde mal
     if (/^\d{6,}$/.test(raw)) {
       return sendText(waId, 'Decime el *nombre* de tu obra social (ej: OSDE, Swiss Medical, Galeno).');
     }
 
     setSession(waId, 'ask_os_token', { ...s.ctx, osName: raw.trim() });
-    await upsertCase(waId, { flow_type: s.ctx.flow, patient_type: 'obra_social', os_name: raw.trim(), service_label: s.ctx.label, status: 'awaiting_os_token', last_message: raw.slice(0, 160) });
+
+    await upsertCase(waId, {
+      flow_type: s.ctx.flow,
+      patient_type: 'obra_social',
+      os_name: raw.trim(),
+      service_label: s.ctx.label,
+      status: 'awaiting_os_token',
+      last_message: raw.slice(0, 160),
+    });
+
     return sendText(waId, askOsTokenText());
   }
 
@@ -622,8 +715,16 @@ async function handleUserText(waId, rawText) {
     const osName = s.ctx.osName || '';
     const osToken = raw.trim();
 
-    await upsertCase(waId, { flow_type: flow, patient_type: 'obra_social', os_name: osName, os_token: osToken, service_label: label, status: 'awaiting_payment', last_message: raw.slice(0, 160) });
-    await logEvent(waId, caseId, 'os_data', 'os_token_received', { osName, osToken });
+    await upsertCase(waId, {
+      flow_type: flow,
+      patient_type: 'obra_social',
+      os_name: osName,
+      os_token: osToken,
+      service_label: label,
+      status: 'awaiting_payment',
+      last_message: raw.slice(0, 160),
+    });
+    await appendEvent(waId, caseId, 'os', 'os_token_received', { osName, osToken });
 
     const mp = await createMpPreference({
       caseId,
@@ -637,13 +738,24 @@ async function handleUserText(waId, rawText) {
 
     if (!mp.ok) {
       setSession(waId, 'handoff', {});
-      await upsertCase(waId, { flow_type: flow, patient_type: 'obra_social', os_name: osName, os_token: osToken, service_label: label, status: 'mp_failed', last_message: 'mp_failed' });
+      await upsertCase(waId, { status: 'mp_failed', last_message: 'mp_failed' });
+      await appendEvent(waId, caseId, 'mp', 'mp_failed', mp);
       return sendText(waId, `Listo ✅ Tomé tus datos.\nAhora no pude generar el link.\nEscribí “recepción” y te lo hacen manual.`);
     }
 
     setSession(waId, 'awaiting_payment', { flow, label, patientType: 'obra_social', osName, osToken, mpLink: mp.init_point });
-    await upsertCase(waId, { flow_type: flow, patient_type: 'obra_social', os_name: osName, os_token: osToken, service_label: label, payment_link: mp.init_point, status: 'awaiting_payment', last_message: 'mp_link_sent' });
-    await logEvent(waId, caseId, 'mp_link', 'mp_link_created', mp);
+
+    await upsertCase(waId, {
+      flow_type: flow,
+      patient_type: 'obra_social',
+      os_name: osName,
+      os_token: osToken,
+      service_label: label,
+      payment_link: mp.init_point,
+      status: 'awaiting_payment',
+      last_message: 'mp_link_sent',
+    });
+    await appendEvent(waId, caseId, 'mp', 'mp_link_created', mp);
 
     return sendText(waId, paymentLinkText(mp.init_point));
   }
@@ -667,7 +779,8 @@ async function handleUserText(waId, rawText) {
         last_message: raw.slice(0, 160),
       });
 
-      await logEvent(waId, caseId, 'receipt', `receipt=${receiptId} op=${opId}`, { receiptId, opId });
+      await appendEvent(waId, caseId, 'receipt', `receipt=${receiptId} op=${opId}`, { receiptId, opId });
+
       await sendText(waId, receiptAckText(receiptId));
       return sendText(waId, finalConfirmedText(receiptId));
     }
@@ -676,7 +789,7 @@ async function handleUserText(waId, rawText) {
     return sendText(waId, `Cuando pagues, mandame el *ID de operación* (ej: “ID 123456789”) o una *captura* ✅`);
   }
 
-  // -------- Atajos SOLO en menú --------
+  // ---------- ATAJOS SOLO EN MENU ----------
   if (s.state === 'menu') {
     if (norm === '0' || norm === 'menu' || norm === 'menú' || norm === 'inicio') {
       resetSession(waId);
@@ -684,7 +797,7 @@ async function handleUserText(waId, rawText) {
       return sendText(waId, menuText());
     }
 
-    // atajo OS/prepagas solo en menu
+    // Atajo OS / prepagas SOLO en menu (evita loops)
     if (norm.includes('obra') || norm.includes('prepaga') || norm.includes('osde') || norm.includes('swiss')) {
       await upsertCase(waId, { status: 'info_os', last_message: raw.slice(0, 160) });
       return sendText(
@@ -696,12 +809,14 @@ async function handleUserText(waId, rawText) {
     if (norm === '1') {
       setSession(waId, 'awaiting_mrturno_done', { flow: 'turno', label: 'Turno' });
       await upsertCase(waId, { flow_type: 'turno', service_label: 'Turno', status: 'awaiting_mrturno', last_message: raw.slice(0, 160) });
+      await appendEvent(waId, caseId, 'menu', 'turno', {});
       return sendText(waId, mrTurnoText('Perfecto ✅'));
     }
 
     if (norm === '2') {
       setSession(waId, 'awaiting_mrturno_done', { flow: 'estudio', label: 'Estudios' });
       await upsertCase(waId, { flow_type: 'estudio', service_label: 'Estudios', status: 'awaiting_mrturno', last_message: raw.slice(0, 160) });
+      await appendEvent(waId, caseId, 'menu', 'estudios', {});
       return sendText(waId, mrTurnoText('Perfecto ✅'));
     }
 
@@ -721,6 +836,7 @@ async function handleUserText(waId, rawText) {
     if (norm === '5' || norm.includes('recep') || norm.includes('humano')) {
       setSession(waId, 'handoff', {});
       await upsertCase(waId, { status: 'handoff', last_message: raw.slice(0, 160) });
+      await appendEvent(waId, caseId, 'handoff', 'handoff_requested', {});
       return sendText(waId, `Listo ✅ Te paso con recepción.\nContame en 1 línea qué necesitás (especialidad/estudio + día preferido).`);
     }
 
@@ -734,7 +850,7 @@ async function handleUserText(waId, rawText) {
   return sendText(waId, menuText());
 }
 
-// ========== Webhook Verify ==========
+// ================= Webhook Verify =================
 function verifyHandler(req, res) {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -758,7 +874,7 @@ function verifyHandler(req, res) {
   return res.sendStatus(403);
 }
 
-// ========== Webhook POST ==========
+// ================= Webhook POST =================
 async function postHandler(req, res) {
   const sig = req.header('x-hub-signature-256');
   const okSig = verifyMetaSignature(req.body, sig, META_APP_SECRET);
@@ -793,6 +909,8 @@ async function postHandler(req, res) {
     if (!msg) return;
 
     const msgId = msg.id;
+    const from = msg.from;
+
     if (msgId) {
       if (seenMsg.has(msgId)) {
         log('info', 'wa_dedup_ignored', { msgId });
@@ -801,9 +919,7 @@ async function postHandler(req, res) {
       seenMsg.set(msgId, Date.now());
     }
 
-    const from = msg.from;
     const text = msg?.text?.body ? String(msg.text.body) : '';
-
     log('info', 'wa_inbound', { from, msgId, text_preview: text.slice(0, 140) });
 
     const hasMedia =
@@ -815,10 +931,11 @@ async function postHandler(req, res) {
 
     if (hasMedia) {
       const s = getSession(from);
-      const caseId = await getOrCreateCaseId(from);
 
-      // si está esperando pago, con media confirmamos igual (sin op id)
+      // Si está esperando pago, con media confirmamos igual (sin op id)
       if (s.state === 'awaiting_payment') {
+        const pack = await ensureCase(from);
+        const caseId = pack.caseObj.case_id;
         const receiptId = makeId('CEPA');
         resetSession(from);
 
@@ -835,25 +952,24 @@ async function postHandler(req, res) {
           last_message: 'media_proof',
         });
 
-        await logEvent(from, caseId, 'receipt_media', `receipt=${receiptId}`, { receiptId });
+        await appendEvent(from, caseId, 'receipt', `receipt=${receiptId} media=1`, { receiptId });
+
         await sendText(from, receiptAckText(receiptId));
         await sendText(from, finalConfirmedText(receiptId));
         return;
       }
 
-      await upsertCase(from, { status: 'media_received', last_message: 'media' });
       return sendText(from, `Recibido ✅\n\n${menuText()}`);
     }
 
     if (!text.trim()) return sendText(from, menuText());
-
     await handleUserText(from, text);
   } catch (e) {
     log('error', 'wa_handle_failed', { err: String(e?.message || e) });
   }
 }
 
-// ========== Routes ==========
+// ================= Routes =================
 app.get('/health', (_req, res) =>
   res.status(200).json({ ok: true, uptime_s: Math.floor((Date.now() - STARTED_AT) / 1000) })
 );
@@ -871,13 +987,16 @@ app.get('/privacidad', (_req, res) => {
 
 app.get('/api/whatsapp', verifyHandler);
 app.get('/webhook', verifyHandler);
+
 app.post('/api/whatsapp', express.raw({ type: '*/*', limit: '2mb' }), postHandler);
 app.post('/webhook', express.raw({ type: '*/*', limit: '2mb' }), postHandler);
 
-// ========== Start ==========
-const port = Number(PORT);
-app.listen(port, '0.0.0.0', () => {
-  const hasGsheet = !!SPREADSHEET_ID && (!!GSHEET_SA_JSON_BASE64 || (!!GSHEET_CLIENT_EMAIL && !!GSHEET_PRIVATE_KEY));
+// ================= Start =================
+app.listen(Number(PORT), '0.0.0.0', () => {
+  const hasGsheet =
+    !!SPREADSHEET_ID &&
+    (!!GSHEET_SA_JSON_BASE64 || (!!GSHEET_CLIENT_EMAIL && !!GSHEET_PRIVATE_KEY));
+
   log('info', 'gsheet_ready', {
     has_gsheet: hasGsheet,
     has_sheet_id: !!SPREADSHEET_ID,
@@ -885,7 +1004,7 @@ app.listen(port, '0.0.0.0', () => {
   });
 
   log('info', 'server_started', {
-    port,
+    port: Number(PORT),
     has_WA_ACCESS_TOKEN: !!WA_ACCESS_TOKEN,
     has_WA_VERIFY_TOKEN: !!WA_VERIFY_TOKEN,
     has_WA_PHONE_NUMBER_ID: !!WA_PHONE_NUMBER_ID,
