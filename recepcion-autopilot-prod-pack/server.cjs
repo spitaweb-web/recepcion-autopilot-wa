@@ -1,17 +1,6 @@
 'use strict';
 
-/**
- * CEPA Recepción Autopilot — WhatsApp Cloud API — Node/Express
- * + Google Sheets: cases (UPDATE por wa_from) + events (APPEND)
- * + MercadoPago seña (preference init_point)
- *
- * Fix PRO:
- * ✅ UPSERT cases por wa_from (col C) => NO duplica al reiniciar Render
- * ✅ events siempre APPEND (auditoría)
- * ✅ State-first: no pisa ask_os_name/ask_os_token con atajos
- * ✅ Atajo OSDE/obra social SOLO en menu
- * ✅ Logs: gsheet_ready + gsheet_update + gsheet_append
- */
+
 
 
 const app = express();
