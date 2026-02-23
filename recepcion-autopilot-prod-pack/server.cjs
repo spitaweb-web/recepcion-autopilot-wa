@@ -12,7 +12,9 @@
  * ✅ Atajo OSDE/obra social SOLO en menu
  * ✅ Logs: gsheet_ready + gsheet_update + gsheet_append
  */
-
+app.post("/auth/login/", loginHandler);
+app.post("/auth/login", loginHandler);
+app.post("/login", loginHandler); // por las dudas
 const express = require('express');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
