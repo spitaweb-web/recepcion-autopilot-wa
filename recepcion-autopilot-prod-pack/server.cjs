@@ -1,8 +1,14 @@
 'use strict';
 
+// ================= Imports (FIX) =================
+const express = require('express');                 // <- faltaba (tu error)
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const crypto = require('crypto');
+const { google } = require('googleapis');
+// Node 20 ya trae fetch global (ok)
 
-
-
+// ================= App =================
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
@@ -674,7 +680,6 @@ async function handleUserText(waId, rawText) {
   }
 
   if (s.state === 'ask_os_name') {
-    // Evitar que manden números y se guarde mal
     if (/^\d{6,}$/.test(raw)) {
       return sendText(waId, 'Decime el *nombre* de tu obra social (ej: OSDE, Swiss Medical, Galeno).');
     }
@@ -781,7 +786,6 @@ async function handleUserText(waId, rawText) {
       return sendText(waId, menuText());
     }
 
-    // Atajo OS / prepagas SOLO en menu (evita loops)
     if (norm.includes('obra') || norm.includes('prepaga') || norm.includes('osde') || norm.includes('swiss')) {
       await upsertCase(waId, { status: 'info_os', last_message: raw.slice(0, 160) });
       return sendText(
@@ -916,7 +920,6 @@ async function postHandler(req, res) {
     if (hasMedia) {
       const s = getSession(from);
 
-      // Si está esperando pago, con media confirmamos igual (sin op id)
       if (s.state === 'awaiting_payment') {
         const pack = await ensureCase(from);
         const caseId = pack.caseObj.case_id;
