@@ -1,12 +1,11 @@
 'use strict';
 
 // ================= Imports (FIX) =================
-const express = require('express');                 // <- faltaba (tu error)
+const express = require('express');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
 const { google } = require('googleapis');
-// Node 20 ya trae fetch global (ok)
 
 // ================= App =================
 const app = express();
@@ -46,7 +45,7 @@ const {
   // MrTurno override opcional
   MR_TURNO_URL,
 
-  // Google Sheets (Render suele usar GSHEET_ID)
+  // Google Sheets
   GSHEET_SPREADSHEET_ID,
   GSHEET_ID,
   GSHEET_SA_JSON_BASE64,
@@ -113,6 +112,22 @@ function extractOpId(text) {
   if (m) return m[2];
   const n = s.match(/\b(\d{10,})\b/); // fallback largo
   return n ? n[1] : '';
+}
+
+function looksPaidIntent(norm) {
+  // “pagué / pague / ya / listo / ok / transferí / aboné”
+  return (
+    norm === 'pague' ||
+    norm === 'pagué' ||
+    norm === 'pago' ||
+    norm === 'pagado' ||
+    norm === 'ya' ||
+    norm === 'listo' ||
+    norm === 'ok' ||
+    norm.includes('ya pag') ||
+    norm.includes('abon') ||
+    norm.includes('transfer')
+  );
 }
 
 async function sendText(toWaId, text) {
@@ -261,6 +276,26 @@ async function sheetUpdateRow(rowNumber, values) {
   }
 }
 
+async function sheetBatchUpdate(pairs) {
+  try {
+    const sheets = await getSheetsClient();
+    if (!sheets) return { ok: false, reason: 'missing_gsheet_env' };
+
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId: SPREADSHEET_ID,
+      requestBody: {
+        valueInputOption: 'RAW',
+        data: pairs,
+      },
+    });
+
+    return { ok: true };
+  } catch (e) {
+    log('error', 'gsheet_batch_failed', { err: String(e?.message || e) });
+    return { ok: false, reason: 'batch_failed' };
+  }
+}
+
 function normalizeRowLen(arr, len) {
   const v = Array.isArray(arr) ? [...arr] : [];
   while (v.length < len) v.push('');
@@ -310,18 +345,17 @@ function caseObjToRow(c) {
 const caseCache = new Map();
 
 async function findCaseRowByWa(waId) {
-  // Leemos B:C para encontrar row + case_id sin traer todo el sheet
+  // Lee B:C (case_id, wa_from)
   const r = await sheetGet(`${SHEET_CASES}!B:C`);
   if (!r.ok) return null;
 
   const values = r.values || [];
-  // values[0] es header si existe
   for (let i = 1; i < values.length; i++) {
     const row = values[i] || [];
-    const caseId = row[0] || ''; // col B
-    const wa = row[1] || '';     // col C
+    const caseId = row[0] || '';
+    const wa = row[1] || '';
     if (String(wa) === String(waId)) {
-      const rowNumber = i + 1; // porque i=1 => row 2
+      const rowNumber = i + 1;
       return { rowNumber, caseId };
     }
   }
@@ -336,10 +370,8 @@ async function loadCaseFromSheet(rowNumber) {
 }
 
 async function ensureCase(waId) {
-  // 1) cache
   if (caseCache.has(waId)) return caseCache.get(waId);
 
-  // 2) buscar existente por wa_from
   const found = await findCaseRowByWa(waId);
   if (found) {
     const caseObj = await loadCaseFromSheet(found.rowNumber);
@@ -350,7 +382,6 @@ async function ensureCase(waId) {
     }
   }
 
-  // 3) crear nuevo caso (append) y luego resolvemos rowNumber por búsqueda inmediata
   const caseId = makeId('CASE');
   const now = nowISO();
 
@@ -373,7 +404,6 @@ async function ensureCase(waId) {
 
   await sheetAppend(`${SHEET_CASES}!A:N`, caseObjToRow(newCase));
 
-  // buscar row recién creado (simple y robusto)
   const foundAfter = await findCaseRowByWa(waId);
   const rowNumber = foundAfter ? foundAfter.rowNumber : 2;
 
@@ -401,6 +431,18 @@ async function upsertCase(waId, patch) {
   return next;
 }
 
+// ✅ Touch pro (solo M y N) para que el inbox nunca quede “congelado”
+async function touchCaseMN(waId, lastMessage) {
+  const pack = await ensureCase(waId);
+  const rn = pack.rowNumber;
+  const ts = nowISO();
+  await sheetBatchUpdate([
+    { range: `${SHEET_CASES}!M${rn}`, values: [[String(lastMessage || '').slice(0, 220)]] },
+    { range: `${SHEET_CASES}!N${rn}`, values: [[ts]] },
+  ]);
+  return ts;
+}
+
 async function appendEvent(waId, caseId, eventType, payloadPreview, payloadObj) {
   const row = [
     makeId('EV'),
@@ -414,7 +456,7 @@ async function appendEvent(waId, caseId, eventType, payloadPreview, payloadObj) 
   await sheetAppend(`${SHEET_EVENTS}!A:G`, row);
 }
 
-// ================= MercadoPago =================
+// ================= MercadoPago (REAL VALIDATION) =================
 async function createMpPreference({ caseId, waId, label, patientType, osName, osToken, amount }) {
   if (!MP_ACCESS_TOKEN) return { ok: false, reason: 'missing_mp_token' };
 
@@ -465,6 +507,84 @@ async function createMpPreference({ caseId, waId, label, patientType, osName, os
 
   const data = await resp.json();
   return { ok: true, init_point: data.init_point, pref_id: data.id };
+}
+
+async function mpGetPayment(paymentId) {
+  if (!MP_ACCESS_TOKEN) return { ok: false, reason: 'missing_mp_token' };
+
+  const resp = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
+    headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
+  });
+
+  if (!resp.ok) {
+    let j = {};
+    try { j = await resp.json(); } catch {}
+    return { ok: false, status: resp.status, err: j };
+  }
+
+  const data = await resp.json();
+  return { ok: true, data };
+}
+
+async function mpSearchByExternalRef(caseId) {
+  if (!MP_ACCESS_TOKEN) return { ok: false, reason: 'missing_mp_token' };
+
+  const url = `https://api.mercadopago.com/v1/payments/search?external_reference=${encodeURIComponent(
+    String(caseId || '')
+  )}&sort=date_created&criteria=desc&limit=5`;
+
+  const resp = await fetch(url, {
+    headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
+  });
+
+  if (!resp.ok) {
+    let j = {};
+    try { j = await resp.json(); } catch {}
+    return { ok: false, status: resp.status, err: j };
+  }
+
+  const data = await resp.json();
+  const results = Array.isArray(data?.results) ? data.results : [];
+  return { ok: true, results };
+}
+
+function mpPaymentMatches(pay, caseId, amountExpected) {
+  const status = String(pay?.status || '');
+  const ext = String(pay?.external_reference || '');
+  const amount = Number(pay?.transaction_amount || 0);
+
+  if (status !== 'approved') return { ok: false, reason: `status_${status || 'unknown'}` };
+  if (!ext || ext !== String(caseId)) return { ok: false, reason: 'external_reference_mismatch' };
+
+  // tolerancia simple por redondeos: exacto o igual
+  if (Number.isFinite(amountExpected) && amountExpected > 0) {
+    if (Math.abs(amount - Number(amountExpected)) > 0.001) return { ok: false, reason: 'amount_mismatch' };
+  }
+
+  return { ok: true };
+}
+
+async function confirmPaymentFlow({ waId, caseId, paymentId, ctx, label }) {
+  const receiptId = makeId('CEPA');
+  resetSession(waId);
+
+  await upsertCase(waId, {
+    flow_type: ctx.flow,
+    patient_type: ctx.patientType,
+    os_name: ctx.osName || '',
+    os_token: ctx.osToken || '',
+    service_label: label || '',
+    deposit_amount: String(DEPOSIT_VALUE),
+    payment_link: ctx.mpLink || '',
+    payment_op_id: String(paymentId || ''),
+    status: 'confirmed',
+    last_message: `Pago MP aprobado (${paymentId})`,
+  });
+
+  await appendEvent(waId, caseId, 'mp', 'mp_payment_approved', { paymentId, receiptId });
+
+  await sendText(waId, `Pago confirmado ✅ (Mercado Pago)\n🧾 Comprobante: ${receiptId}`);
+  return sendText(waId, finalConfirmedText(receiptId));
 }
 
 // ================= Data + Copy =================
@@ -534,13 +654,8 @@ function paymentLinkText(url) {
 
 🔗 Link de pago: ${url}
 
-Cuando pagues, mandame el *ID de operación* (por ejemplo: "ID 123456789") o una *captura* y queda confirmado.`;
-}
-
-function receiptAckText(receiptId) {
-  return `Recibido ✅ Ya registré tu pago.
-
-🧾 Comprobante: ${receiptId}`;
+Cuando pagues, escribime “PAGUÉ” (o “LISTO”).  
+Si preferís, también podés mandar una captura, pero la confirmación es automática cuando Mercado Pago aprueba el pago.`;
 }
 
 function finalConfirmedText(receiptId) {
@@ -592,40 +707,46 @@ async function handleUserText(waId, rawText) {
   const firstLine = raw.split('\n').map(s => s.trim()).filter(Boolean)[0] || raw;
   const norm = normalize(firstLine);
 
-  const s = getSession(waId);
+  const sess = getSession(waId);
   const pack = await ensureCase(waId);
   const caseId = pack.caseObj.case_id;
 
+  // siempre logueamos inbound y tocamos M/N
+  await appendEvent(waId, caseId, 'message_in', raw.slice(0, 140), { text: raw });
+  await touchCaseMN(waId, raw.slice(0, 160));
+
   // ---------- STATE-FIRST ----------
-  if (s.state === 'awaiting_mrturno_done') {
+  if (sess.state === 'awaiting_mrturno_done') {
     if (['listo','ok','dale','ya'].includes(norm)) {
-      setSession(waId, 'ask_patient_type', { flow: s.ctx.flow, label: s.ctx.label });
+      setSession(waId, 'ask_patient_type', { flow: sess.ctx.flow, label: sess.ctx.label });
 
       await upsertCase(waId, {
-        flow_type: s.ctx.flow,
-        service_label: s.ctx.label,
+        flow_type: sess.ctx.flow,
+        service_label: sess.ctx.label,
         status: 'awaiting_patient_type',
         last_message: raw.slice(0, 160),
       });
       await appendEvent(waId, caseId, 'state', 'ask_patient_type', { from: 'awaiting_mrturno_done' });
 
-      return sendText(waId, patientTypePrompt());
+      await sendText(waId, patientTypePrompt());
+      return;
     }
 
     await upsertCase(waId, {
-      flow_type: s.ctx.flow,
-      service_label: s.ctx.label,
+      flow_type: sess.ctx.flow,
+      service_label: sess.ctx.label,
       status: 'awaiting_mrturno',
       last_message: raw.slice(0, 160),
     });
 
-    return sendText(waId, `Cuando tengas el turno en MrTurno, escribime “LISTO” ✅`);
+    await sendText(waId, `Cuando tengas el turno en MrTurno, escribime “LISTO” ✅`);
+    return;
   }
 
-  if (s.state === 'ask_patient_type') {
+  if (sess.state === 'ask_patient_type') {
     if (norm === '1') {
-      const flow = s.ctx.flow || 'turno';
-      const label = s.ctx.label || 'Turno';
+      const flow = sess.ctx.flow || 'turno';
+      const label = sess.ctx.label || 'Turno';
 
       await upsertCase(waId, {
         flow_type: flow,
@@ -647,7 +768,8 @@ async function handleUserText(waId, rawText) {
         setSession(waId, 'handoff', {});
         await upsertCase(waId, { status: 'mp_failed', last_message: 'mp_failed' });
         await appendEvent(waId, caseId, 'mp', 'mp_failed', mp);
-        return sendText(waId, `Ahora mismo no pude generar el link. Escribí “recepción” y te lo resuelven ✅`);
+        await sendText(waId, `Ahora mismo no pude generar el link. Escribí “recepción” y te lo resuelven ✅`);
+        return;
       }
 
       setSession(waId, 'awaiting_payment', { flow, label, patientType: 'particular', mpLink: mp.init_point });
@@ -657,51 +779,56 @@ async function handleUserText(waId, rawText) {
         service_label: label,
         payment_link: mp.init_point,
         status: 'awaiting_payment',
-        last_message: 'mp_link_sent',
+        last_message: 'Link de pago enviado',
       });
       await appendEvent(waId, caseId, 'mp', 'mp_link_created', mp);
 
-      return sendText(waId, paymentLinkText(mp.init_point));
+      await sendText(waId, paymentLinkText(mp.init_point));
+      return;
     }
 
     if (norm === '2') {
-      setSession(waId, 'ask_os_name', { flow: s.ctx.flow, label: s.ctx.label, patientType: 'obra_social' });
+      setSession(waId, 'ask_os_name', { flow: sess.ctx.flow, label: sess.ctx.label, patientType: 'obra_social' });
       await upsertCase(waId, {
-        flow_type: s.ctx.flow,
+        flow_type: sess.ctx.flow,
         patient_type: 'obra_social',
-        service_label: s.ctx.label,
+        service_label: sess.ctx.label,
         status: 'awaiting_os_name',
         last_message: raw.slice(0, 160),
       });
-      return sendText(waId, askOsNameText());
+      await sendText(waId, askOsNameText());
+      return;
     }
 
-    return sendText(waId, `Respondeme 1 (Particular) o 2 (Obra social).`);
+    await sendText(waId, `Respondeme 1 (Particular) o 2 (Obra social).`);
+    return;
   }
 
-  if (s.state === 'ask_os_name') {
+  if (sess.state === 'ask_os_name') {
     if (/^\d{6,}$/.test(raw)) {
-      return sendText(waId, 'Decime el *nombre* de tu obra social (ej: OSDE, Swiss Medical, Galeno).');
+      await sendText(waId, 'Decime el *nombre* de tu obra social (ej: OSDE, Swiss Medical, Galeno).');
+      return;
     }
 
-    setSession(waId, 'ask_os_token', { ...s.ctx, osName: raw.trim() });
+    setSession(waId, 'ask_os_token', { ...sess.ctx, osName: raw.trim() });
 
     await upsertCase(waId, {
-      flow_type: s.ctx.flow,
+      flow_type: sess.ctx.flow,
       patient_type: 'obra_social',
       os_name: raw.trim(),
-      service_label: s.ctx.label,
+      service_label: sess.ctx.label,
       status: 'awaiting_os_token',
       last_message: raw.slice(0, 160),
     });
 
-    return sendText(waId, askOsTokenText());
+    await sendText(waId, askOsTokenText());
+    return;
   }
 
-  if (s.state === 'ask_os_token') {
-    const flow = s.ctx.flow || 'turno';
-    const label = s.ctx.label || 'Turno';
-    const osName = s.ctx.osName || '';
+  if (sess.state === 'ask_os_token') {
+    const flow = sess.ctx.flow || 'turno';
+    const label = sess.ctx.label || 'Turno';
+    const osName = sess.ctx.osName || '';
     const osToken = raw.trim();
 
     await upsertCase(waId, {
@@ -729,7 +856,8 @@ async function handleUserText(waId, rawText) {
       setSession(waId, 'handoff', {});
       await upsertCase(waId, { status: 'mp_failed', last_message: 'mp_failed' });
       await appendEvent(waId, caseId, 'mp', 'mp_failed', mp);
-      return sendText(waId, `Listo ✅ Tomé tus datos.\nAhora no pude generar el link.\nEscribí “recepción” y te lo hacen manual.`);
+      await sendText(waId, `Listo ✅ Tomé tus datos.\nAhora no pude generar el link.\nEscribí “recepción” y te lo hacen manual.`);
+      return;
     }
 
     setSession(waId, 'awaiting_payment', { flow, label, patientType: 'obra_social', osName, osToken, mpLink: mp.init_point });
@@ -742,100 +870,136 @@ async function handleUserText(waId, rawText) {
       service_label: label,
       payment_link: mp.init_point,
       status: 'awaiting_payment',
-      last_message: 'mp_link_sent',
+      last_message: 'Link de pago enviado',
     });
     await appendEvent(waId, caseId, 'mp', 'mp_link_created', mp);
 
-    return sendText(waId, paymentLinkText(mp.init_point));
+    await sendText(waId, paymentLinkText(mp.init_point));
+    return;
   }
 
-  if (s.state === 'awaiting_payment') {
+  if (sess.state === 'awaiting_payment') {
+    // ✅ 1) Si mandó un paymentId / opId: validamos por /v1/payments/:id
     const opId = extractOpId(raw);
     if (opId) {
-      const receiptId = makeId('CEPA');
-      resetSession(waId);
+      const chk = await mpGetPayment(opId);
+      if (chk.ok) {
+        const match = mpPaymentMatches(chk.data, caseId, DEPOSIT_VALUE);
+        if (match.ok) {
+          await confirmPaymentFlow({ waId, caseId, paymentId: opId, ctx: sess.ctx, label: sess.ctx.label });
+          return;
+        }
+        // no aprobado / mismatch
+        await upsertCase(waId, { status: 'awaiting_payment', last_message: `Pago en revisión (${match.reason})` });
+        await appendEvent(waId, caseId, 'mp', 'mp_payment_not_approved', {
+          paymentId: opId,
+          reason: match.reason,
+          status: chk.data?.status,
+        });
+        await sendText(waId, `Gracias ✅ Lo estoy validando.\nAún no figura como *aprobado* en Mercado Pago.\nSi en unos minutos sigue igual, mandá una captura o escribí “recepción”.`);
+        return;
+      }
 
-      await upsertCase(waId, {
-        flow_type: s.ctx.flow,
-        patient_type: s.ctx.patientType,
-        os_name: s.ctx.osName || '',
-        os_token: s.ctx.osToken || '',
-        service_label: s.ctx.label || '',
-        deposit_amount: String(DEPOSIT_VALUE),
-        payment_link: s.ctx.mpLink || '',
-        payment_op_id: opId,
-        status: 'confirmed',
-        last_message: raw.slice(0, 160),
-      });
+      await appendEvent(waId, caseId, 'mp', 'mp_payment_lookup_failed', { opId, err: chk });
+      await sendText(waId, `No pude validar ese ID ahora mismo.\nMandá “PAGUÉ” o una captura, o escribí “recepción”.`);
+      return;
+    }
 
-      await appendEvent(waId, caseId, 'receipt', `receipt=${receiptId} op=${opId}`, { receiptId, opId });
+    // ✅ 2) Si dice “PAGUÉ/LISTO/YA”: buscamos por external_reference (caseId)
+    if (looksPaidIntent(norm)) {
+      const sr = await mpSearchByExternalRef(caseId);
+      if (sr.ok) {
+        const cand = (sr.results || [])[0];
+        if (cand) {
+          const match = mpPaymentMatches(cand, caseId, DEPOSIT_VALUE);
+          if (match.ok) {
+            await confirmPaymentFlow({ waId, caseId, paymentId: cand.id, ctx: sess.ctx, label: sess.ctx.label });
+            return;
+          }
+        }
 
-      await sendText(waId, receiptAckText(receiptId));
-      return sendText(waId, finalConfirmedText(receiptId));
+        await upsertCase(waId, { status: 'awaiting_payment', last_message: 'Pago aún no aprobado' });
+        await appendEvent(waId, caseId, 'mp', 'mp_search_no_approved', { count: (sr.results || []).length });
+        await sendText(waId, `Gracias ✅ todavía no figura como *aprobado*.\nSi pagaste recién, puede demorar unos minutos.\nSi querés, mandá una captura o escribí “recepción”.`);
+        return;
+      }
+
+      await appendEvent(waId, caseId, 'mp', 'mp_search_failed', sr);
+      await sendText(waId, `Ahora mismo no pude validar el pago automáticamente.\nMandá una captura o escribí “recepción”.`);
+      return;
     }
 
     await upsertCase(waId, { status: 'awaiting_payment', last_message: raw.slice(0, 160) });
-    return sendText(waId, `Cuando pagues, mandame el *ID de operación* (ej: “ID 123456789”) o una *captura* ✅`);
+    await sendText(waId, `Cuando pagues, escribime “PAGUÉ” (o “LISTO”) ✅\nSi preferís, mandá una captura.`);
+    return;
   }
 
   // ---------- ATAJOS SOLO EN MENU ----------
-  if (s.state === 'menu') {
+  if (sess.state === 'menu') {
     if (norm === '0' || norm === 'menu' || norm === 'menú' || norm === 'inicio') {
       resetSession(waId);
       await upsertCase(waId, { status: 'menu', last_message: raw.slice(0, 160) });
-      return sendText(waId, menuText());
+      await sendText(waId, menuText());
+      return;
     }
 
     if (norm.includes('obra') || norm.includes('prepaga') || norm.includes('osde') || norm.includes('swiss')) {
       await upsertCase(waId, { status: 'info_os', last_message: raw.slice(0, 160) });
-      return sendText(
+      await sendText(
         waId,
         `Trabajamos con varias obras sociales/prepagas. Algunas frecuentes:\n• ${OBRAS_SOCIALES_TOP.join('\n• ')}\n\nSi me decís cuál tenés, te confirmo si está.`
       );
+      return;
     }
 
     if (norm === '1') {
       setSession(waId, 'awaiting_mrturno_done', { flow: 'turno', label: 'Turno' });
       await upsertCase(waId, { flow_type: 'turno', service_label: 'Turno', status: 'awaiting_mrturno', last_message: raw.slice(0, 160) });
       await appendEvent(waId, caseId, 'menu', 'turno', {});
-      return sendText(waId, mrTurnoText('Perfecto ✅'));
+      await sendText(waId, mrTurnoText('Perfecto ✅'));
+      return;
     }
 
     if (norm === '2') {
       setSession(waId, 'awaiting_mrturno_done', { flow: 'estudio', label: 'Estudios' });
       await upsertCase(waId, { flow_type: 'estudio', service_label: 'Estudios', status: 'awaiting_mrturno', last_message: raw.slice(0, 160) });
       await appendEvent(waId, caseId, 'menu', 'estudios', {});
-      return sendText(waId, mrTurnoText('Perfecto ✅'));
+      await sendText(waId, mrTurnoText('Perfecto ✅'));
+      return;
     }
 
     if (norm === '3') {
       await upsertCase(waId, { status: 'info_os', last_message: raw.slice(0, 160) });
-      return sendText(
+      await sendText(
         waId,
         `Trabajamos con varias obras sociales/prepagas. Algunas frecuentes:\n• ${OBRAS_SOCIALES_TOP.join('\n• ')}\n\nSi me decís cuál tenés, te confirmo si está.`
       );
+      return;
     }
 
     if (norm === '4') {
       await upsertCase(waId, { status: 'info_contacto', last_message: raw.slice(0, 160) });
-      return sendText(waId, infoContacto());
+      await sendText(waId, infoContacto());
+      return;
     }
 
     if (norm === '5' || norm.includes('recep') || norm.includes('humano')) {
       setSession(waId, 'handoff', {});
       await upsertCase(waId, { status: 'handoff', last_message: raw.slice(0, 160) });
       await appendEvent(waId, caseId, 'handoff', 'handoff_requested', {});
-      return sendText(waId, `Listo ✅ Te paso con recepción.\nContame en 1 línea qué necesitás (especialidad/estudio + día preferido).`);
+      await sendText(waId, `Listo ✅ Te paso con recepción.\nContame en 1 línea qué necesitás (especialidad/estudio + día preferido).`);
+      return;
     }
 
     await upsertCase(waId, { status: 'menu', last_message: raw.slice(0, 160) });
-    return sendText(waId, menuText());
+    await sendText(waId, menuText());
+    return;
   }
 
   // fallback total
   resetSession(waId);
   await upsertCase(waId, { status: 'fallback', last_message: raw.slice(0, 160) });
-  return sendText(waId, menuText());
+  await sendText(waId, menuText());
 }
 
 // ================= Webhook Verify =================
@@ -918,38 +1082,47 @@ async function postHandler(req, res) {
       !!msg?.sticker;
 
     if (hasMedia) {
-      const s = getSession(from);
+      const sess = getSession(from);
+      const pack = await ensureCase(from);
+      const caseId = pack.caseObj.case_id;
 
-      if (s.state === 'awaiting_payment') {
-        const pack = await ensureCase(from);
-        const caseId = pack.caseObj.case_id;
-        const receiptId = makeId('CEPA');
-        resetSession(from);
+      await appendEvent(from, caseId, 'message_in_media', 'media_in', { hasMedia: true });
+      await touchCaseMN(from, 'Comprobante/archivo recibido');
 
+      // ✅ Antes confirmabas “a ojo”. Ahora: intentamos validar por external_reference.
+      if (sess.state === 'awaiting_payment') {
+        const sr = await mpSearchByExternalRef(caseId);
+        if (sr.ok) {
+          const cand = (sr.results || [])[0];
+          if (cand) {
+            const match = mpPaymentMatches(cand, caseId, DEPOSIT_VALUE);
+            if (match.ok) {
+              await confirmPaymentFlow({ waId: from, caseId, paymentId: cand.id, ctx: sess.ctx, label: sess.ctx.label });
+              return;
+            }
+          }
+        }
+
+        // si no pudimos confirmar, pasamos a revisión humana
+        setSession(from, 'handoff', {});
         await upsertCase(from, {
-          flow_type: s.ctx.flow,
-          patient_type: s.ctx.patientType,
-          os_name: s.ctx.osName || '',
-          os_token: s.ctx.osToken || '',
-          service_label: s.ctx.label || '',
-          deposit_amount: String(DEPOSIT_VALUE),
-          payment_link: s.ctx.mpLink || '',
-          payment_op_id: '',
-          status: 'confirmed',
-          last_message: 'media_proof',
+          status: 'payment_review',
+          last_message: 'Comprobante recibido - revisión',
         });
-
-        await appendEvent(from, caseId, 'receipt', `receipt=${receiptId} media=1`, { receiptId });
-
-        await sendText(from, receiptAckText(receiptId));
-        await sendText(from, finalConfirmedText(receiptId));
+        await appendEvent(from, caseId, 'handoff', 'payment_review', {});
+        await sendText(from, `Recibido ✅ Estoy validando el pago.\nSi en breve no se confirma automático, recepción lo revisa y te responde.`);
         return;
       }
 
-      return sendText(from, `Recibido ✅\n\n${menuText()}`);
+      await sendText(from, `Recibido ✅\n\n${menuText()}`);
+      return;
     }
 
-    if (!text.trim()) return sendText(from, menuText());
+    if (!text.trim()) {
+      await sendText(from, menuText());
+      return;
+    }
+
     await handleUserText(from, text);
   } catch (e) {
     log('error', 'wa_handle_failed', { err: String(e?.message || e) });
