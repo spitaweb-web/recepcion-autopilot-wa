@@ -1,6 +1,6 @@
 'use strict';
 
-// ================= Imports (FIX) =================
+// ================= Imports =================
 const express = require('express');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
@@ -41,6 +41,7 @@ const {
   MP_SUCCESS_URL,
   MP_FAILURE_URL,
   MP_PENDING_URL,
+  MP_NOTIFICATION_URL, // ✅ setear a: https://recepcion-autopilot-wa.onrender.com/webhooks/mercadopago
 
   // MrTurno override opcional
   MR_TURNO_URL,
@@ -102,8 +103,11 @@ function makeId(prefix = 'ID') {
 }
 
 function moneyARS(n) {
-  try { return new Intl.NumberFormat('es-AR').format(n); }
-  catch { return String(n); }
+  try {
+    return new Intl.NumberFormat('es-AR').format(n);
+  } catch {
+    return String(n);
+  }
 }
 
 function extractOpId(text) {
@@ -115,7 +119,6 @@ function extractOpId(text) {
 }
 
 function looksPaidIntent(norm) {
-  // “pagué / pague / ya / listo / ok / transferí / aboné”
   return (
     norm === 'pague' ||
     norm === 'pagué' ||
@@ -158,7 +161,9 @@ async function sendText(toWaId, text) {
 
   if (!resp.ok) {
     let j = {};
-    try { j = await resp.json(); } catch {}
+    try {
+      j = await resp.json();
+    } catch {}
     log('error', 'wa_outbound_failed', { status: resp.status, err: j });
     return { ok: false, status: resp.status, err: j };
   }
@@ -180,7 +185,7 @@ const PAYMENT_WINDOW_MS = (() => {
   return safe * 60 * 1000;
 })();
 
-// ================= Google Sheets (UPSERT cases) =================
+// ================= Google Sheets =================
 const SHEET_CASES = 'cases';
 const SHEET_EVENTS = 'events';
 
@@ -323,29 +328,31 @@ function rowToCaseObj(row) {
 }
 
 function caseObjToRow(c) {
-  return normalizeRowLen([
-    c.created_at,
-    c.case_id,
-    c.wa_from,
-    c.flow_type,
-    c.patient_type,
-    c.os_name,
-    c.os_token,
-    c.service_label,
-    c.deposit_amount,
-    c.payment_link,
-    c.payment_op_id,
-    c.status,
-    c.last_message,
-    c.updated_at,
-  ], 14);
+  return normalizeRowLen(
+    [
+      c.created_at,
+      c.case_id,
+      c.wa_from,
+      c.flow_type,
+      c.patient_type,
+      c.os_name,
+      c.os_token,
+      c.service_label,
+      c.deposit_amount,
+      c.payment_link,
+      c.payment_op_id,
+      c.status,
+      c.last_message,
+      c.updated_at,
+    ],
+    14
+  );
 }
 
 // Cache: waId -> { rowNumber, caseObj }
 const caseCache = new Map();
 
 async function findCaseRowByWa(waId) {
-  // Lee B:C (case_id, wa_from)
   const r = await sheetGet(`${SHEET_CASES}!B:C`);
   if (!r.ok) return null;
 
@@ -362,10 +369,27 @@ async function findCaseRowByWa(waId) {
   return null;
 }
 
+async function findCaseRowByCaseId(caseId) {
+  const r = await sheetGet(`${SHEET_CASES}!B:C`);
+  if (!r.ok) return null;
+
+  const values = r.values || [];
+  for (let i = 1; i < values.length; i++) {
+    const row = values[i] || [];
+    const cid = row[0] || '';
+    const wa = row[1] || '';
+    if (String(cid) === String(caseId)) {
+      const rowNumber = i + 1;
+      return { rowNumber, waId: wa };
+    }
+  }
+  return null;
+}
+
 async function loadCaseFromSheet(rowNumber) {
   const r = await sheetGet(`${SHEET_CASES}!A${rowNumber}:N${rowNumber}`);
   if (!r.ok) return null;
-  const row = (r.values && r.values[0]) ? r.values[0] : [];
+  const row = r.values && r.values[0] ? r.values[0] : [];
   return rowToCaseObj(row);
 }
 
@@ -431,7 +455,7 @@ async function upsertCase(waId, patch) {
   return next;
 }
 
-// ✅ Touch pro (solo M y N) para que el inbox nunca quede “congelado”
+// ✅ Touch pro (solo M y N)
 async function touchCaseMN(waId, lastMessage) {
   const pack = await ensureCase(waId);
   const rn = pack.rowNumber;
@@ -464,13 +488,19 @@ async function createMpPreference({ caseId, waId, label, patientType, osName, os
   const expiresTo = new Date(Date.now() + PAYMENT_WINDOW_MS);
 
   const payload = {
-    items: [{
-      title: `Seña - CEPA (${label || 'Turno'})`,
-      quantity: 1,
-      currency_id: 'ARS',
-      unit_price: Number(amount),
-    }],
+    items: [
+      {
+        title: `Seña - CEPA (${label || 'Turno'})`,
+        quantity: 1,
+        currency_id: 'ARS',
+        unit_price: Number(amount),
+      },
+    ],
     external_reference: caseId,
+
+    // ✅ Webhook MP (auto-confirm para Rapipago/efectivo cuando cambia a approved)
+    notification_url: MP_NOTIFICATION_URL || undefined,
+
     expires: true,
     expiration_date_from: expiresFrom.toISOString(),
     expiration_date_to: expiresTo.toISOString(),
@@ -500,7 +530,9 @@ async function createMpPreference({ caseId, waId, label, patientType, osName, os
 
   if (!resp.ok) {
     let j = {};
-    try { j = await resp.json(); } catch {}
+    try {
+      j = await resp.json();
+    } catch {}
     log('error', 'mp_preference_failed', { status: resp.status, err: j });
     return { ok: false, status: resp.status, err: j };
   }
@@ -518,7 +550,9 @@ async function mpGetPayment(paymentId) {
 
   if (!resp.ok) {
     let j = {};
-    try { j = await resp.json(); } catch {}
+    try {
+      j = await resp.json();
+    } catch {}
     return { ok: false, status: resp.status, err: j };
   }
 
@@ -533,13 +567,13 @@ async function mpSearchByExternalRef(caseId) {
     String(caseId || '')
   )}&sort=date_created&criteria=desc&limit=5`;
 
-  const resp = await fetch(url, {
-    headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
-  });
+  const resp = await fetch(url, { headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` } });
 
   if (!resp.ok) {
     let j = {};
-    try { j = await resp.json(); } catch {}
+    try {
+      j = await resp.json();
+    } catch {}
     return { ok: false, status: resp.status, err: j };
   }
 
@@ -556,7 +590,6 @@ function mpPaymentMatches(pay, caseId, amountExpected) {
   if (status !== 'approved') return { ok: false, reason: `status_${status || 'unknown'}` };
   if (!ext || ext !== String(caseId)) return { ok: false, reason: 'external_reference_mismatch' };
 
-  // tolerancia simple por redondeos: exacto o igual
   if (Number.isFinite(amountExpected) && amountExpected > 0) {
     if (Math.abs(amount - Number(amountExpected)) > 0.001) return { ok: false, reason: 'amount_mismatch' };
   }
@@ -564,8 +597,10 @@ function mpPaymentMatches(pay, caseId, amountExpected) {
   return { ok: true };
 }
 
-async function confirmPaymentFlow({ waId, caseId, paymentId, ctx, label }) {
+async function confirmPaymentFlow({ waId, caseId, paymentId, ctx, label, source }) {
   const receiptId = makeId('CEPA');
+
+  // no reseteamos a menu si querés que quede el hilo, pero hoy lo dejamos así
   resetSession(waId);
 
   await upsertCase(waId, {
@@ -581,7 +616,7 @@ async function confirmPaymentFlow({ waId, caseId, paymentId, ctx, label }) {
     last_message: `Pago MP aprobado (${paymentId})`,
   });
 
-  await appendEvent(waId, caseId, 'mp', 'mp_payment_approved', { paymentId, receiptId });
+  await appendEvent(waId, caseId, 'mp', `mp_payment_approved_${source || 'auto'}`, { paymentId, receiptId });
 
   await sendText(waId, `Pago confirmado ✅ (Mercado Pago)\n🧾 Comprobante: ${receiptId}`);
   return sendText(waId, finalConfirmedText(receiptId));
@@ -599,8 +634,18 @@ const CEPA = {
 };
 
 const OBRAS_SOCIALES_TOP = [
-  'OSDE', 'Swiss Medical', 'Galeno', 'Medifé', 'OMINT', 'SanCor Salud', 'Prevención Salud',
-  'Jerárquicos Salud', 'Andes Salud', 'Nobis', 'Federada Salud', 'Medicus'
+  'OSDE',
+  'Swiss Medical',
+  'Galeno',
+  'Medifé',
+  'OMINT',
+  'SanCor Salud',
+  'Prevención Salud',
+  'Jerárquicos Salud',
+  'Andes Salud',
+  'Nobis',
+  'Federada Salud',
+  'Medicus',
 ];
 
 function menuText() {
@@ -655,7 +700,7 @@ function paymentLinkText(url) {
 🔗 Link de pago: ${url}
 
 Cuando pagues, escribime “PAGUÉ” (o “LISTO”).  
-Si preferís, también podés mandar una captura, pero la confirmación es automática cuando Mercado Pago aprueba el pago.`;
+Si preferís, también podés mandar una captura (pero la confirmación real es cuando Mercado Pago aprueba el pago).`;
 }
 
 function finalConfirmedText(receiptId) {
@@ -704,20 +749,20 @@ setInterval(() => {
 // ================= Core Flow (STATE-FIRST) =================
 async function handleUserText(waId, rawText) {
   const raw = String(rawText || '').trim();
-  const firstLine = raw.split('\n').map(s => s.trim()).filter(Boolean)[0] || raw;
+  const firstLine = raw.split('\n').map((s) => s.trim()).filter(Boolean)[0] || raw;
   const norm = normalize(firstLine);
 
   const sess = getSession(waId);
   const pack = await ensureCase(waId);
   const caseId = pack.caseObj.case_id;
 
-  // siempre logueamos inbound y tocamos M/N
+  // log inbound + touch M/N
   await appendEvent(waId, caseId, 'message_in', raw.slice(0, 140), { text: raw });
   await touchCaseMN(waId, raw.slice(0, 160));
 
   // ---------- STATE-FIRST ----------
   if (sess.state === 'awaiting_mrturno_done') {
-    if (['listo','ok','dale','ya'].includes(norm)) {
+    if (['listo', 'ok', 'dale', 'ya'].includes(norm)) {
       setSession(waId, 'ask_patient_type', { flow: sess.ctx.flow, label: sess.ctx.label });
 
       await upsertCase(waId, {
@@ -879,24 +924,27 @@ async function handleUserText(waId, rawText) {
   }
 
   if (sess.state === 'awaiting_payment') {
-    // ✅ 1) Si mandó un paymentId / opId: validamos por /v1/payments/:id
+    // 1) Si manda ID/op: validamos /v1/payments/:id
     const opId = extractOpId(raw);
     if (opId) {
       const chk = await mpGetPayment(opId);
       if (chk.ok) {
         const match = mpPaymentMatches(chk.data, caseId, DEPOSIT_VALUE);
         if (match.ok) {
-          await confirmPaymentFlow({ waId, caseId, paymentId: opId, ctx: sess.ctx, label: sess.ctx.label });
+          await confirmPaymentFlow({ waId, caseId, paymentId: opId, ctx: sess.ctx, label: sess.ctx.label, source: 'by_id' });
           return;
         }
-        // no aprobado / mismatch
+
         await upsertCase(waId, { status: 'awaiting_payment', last_message: `Pago en revisión (${match.reason})` });
         await appendEvent(waId, caseId, 'mp', 'mp_payment_not_approved', {
           paymentId: opId,
           reason: match.reason,
           status: chk.data?.status,
         });
-        await sendText(waId, `Gracias ✅ Lo estoy validando.\nAún no figura como *aprobado* en Mercado Pago.\nSi en unos minutos sigue igual, mandá una captura o escribí “recepción”.`);
+        await sendText(
+          waId,
+          `Gracias ✅ Lo estoy validando.\nAún no figura como *aprobado* en Mercado Pago.\nSi en unos minutos sigue igual, mandá una captura o escribí “recepción”.`
+        );
         return;
       }
 
@@ -905,7 +953,7 @@ async function handleUserText(waId, rawText) {
       return;
     }
 
-    // ✅ 2) Si dice “PAGUÉ/LISTO/YA”: buscamos por external_reference (caseId)
+    // 2) Si dice “PAGUÉ/LISTO/YA”: buscamos por external_reference
     if (looksPaidIntent(norm)) {
       const sr = await mpSearchByExternalRef(caseId);
       if (sr.ok) {
@@ -913,14 +961,17 @@ async function handleUserText(waId, rawText) {
         if (cand) {
           const match = mpPaymentMatches(cand, caseId, DEPOSIT_VALUE);
           if (match.ok) {
-            await confirmPaymentFlow({ waId, caseId, paymentId: cand.id, ctx: sess.ctx, label: sess.ctx.label });
+            await confirmPaymentFlow({ waId, caseId, paymentId: cand.id, ctx: sess.ctx, label: sess.ctx.label, source: 'by_search' });
             return;
           }
         }
 
         await upsertCase(waId, { status: 'awaiting_payment', last_message: 'Pago aún no aprobado' });
         await appendEvent(waId, caseId, 'mp', 'mp_search_no_approved', { count: (sr.results || []).length });
-        await sendText(waId, `Gracias ✅ todavía no figura como *aprobado*.\nSi pagaste recién, puede demorar unos minutos.\nSi querés, mandá una captura o escribí “recepción”.`);
+        await sendText(
+          waId,
+          `Gracias ✅ todavía no figura como *aprobado*.\nSi pagaste recién, puede demorar unos minutos (especialmente Rapipago/Pagofácil).\nSi querés, mandá una captura o escribí “recepción”.`
+        );
         return;
       }
 
@@ -954,7 +1005,12 @@ async function handleUserText(waId, rawText) {
 
     if (norm === '1') {
       setSession(waId, 'awaiting_mrturno_done', { flow: 'turno', label: 'Turno' });
-      await upsertCase(waId, { flow_type: 'turno', service_label: 'Turno', status: 'awaiting_mrturno', last_message: raw.slice(0, 160) });
+      await upsertCase(waId, {
+        flow_type: 'turno',
+        service_label: 'Turno',
+        status: 'awaiting_mrturno',
+        last_message: raw.slice(0, 160),
+      });
       await appendEvent(waId, caseId, 'menu', 'turno', {});
       await sendText(waId, mrTurnoText('Perfecto ✅'));
       return;
@@ -962,7 +1018,12 @@ async function handleUserText(waId, rawText) {
 
     if (norm === '2') {
       setSession(waId, 'awaiting_mrturno_done', { flow: 'estudio', label: 'Estudios' });
-      await upsertCase(waId, { flow_type: 'estudio', service_label: 'Estudios', status: 'awaiting_mrturno', last_message: raw.slice(0, 160) });
+      await upsertCase(waId, {
+        flow_type: 'estudio',
+        service_label: 'Estudios',
+        status: 'awaiting_mrturno',
+        last_message: raw.slice(0, 160),
+      });
       await appendEvent(waId, caseId, 'menu', 'estudios', {});
       await sendText(waId, mrTurnoText('Perfecto ✅'));
       return;
@@ -1002,7 +1063,55 @@ async function handleUserText(waId, rawText) {
   await sendText(waId, menuText());
 }
 
-// ================= Webhook Verify =================
+// ================= MercadoPago Webhook (AUTO-CONFIRM) =================
+// ✅ Para Rapipago/Pagofácil: queda pending y luego MP manda evento -> confirmamos cuando pase a approved
+app.post('/webhooks/mercadopago', express.json({ type: '*/*' }), async (req, res) => {
+  // responder rápido
+  res.status(200).json({ ok: true });
+
+  try {
+    if (!MP_ACCESS_TOKEN) return;
+
+    const paymentId = req.body?.data?.id || req.body?.id;
+    if (!paymentId) return;
+
+    const chk = await mpGetPayment(paymentId);
+    if (!chk.ok) return;
+
+    const pay = chk.data;
+    const status = String(pay.status || '');
+    const caseId = String(pay.external_reference || '');
+    const amount = Number(pay.transaction_amount || 0);
+
+    if (!caseId.startsWith('CASE-')) return;
+
+    // log event (si podemos mapear wa)
+    const found = await findCaseRowByCaseId(caseId);
+    const waId = found?.waId || '';
+
+    await appendEvent(waId, caseId, 'mp', `mp_webhook_status_${status}`, { paymentId, status, amount });
+
+    if (status !== 'approved') return;
+
+    // validación monto (simple)
+    if (Math.abs(amount - Number(DEPOSIT_VALUE)) > 0.001) return;
+
+    if (!waId) return;
+
+    // Confirmación real
+    await upsertCase(waId, {
+      payment_op_id: String(paymentId),
+      status: 'confirmed',
+      last_message: `Pago MP aprobado (webhook ${paymentId})`,
+    });
+
+    await appendEvent(waId, caseId, 'mp', 'mp_payment_approved_webhook', { paymentId, amount });
+  } catch (e) {
+    log('error', 'mp_webhook_failed', { err: String(e?.message || e) });
+  }
+});
+
+// ================= Webhook Verify (Meta) =================
 function verifyHandler(req, res) {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -1026,7 +1135,7 @@ function verifyHandler(req, res) {
   return res.sendStatus(403);
 }
 
-// ================= Webhook POST =================
+// ================= Webhook POST (Meta) =================
 async function postHandler(req, res) {
   const sig = req.header('x-hub-signature-256');
   const okSig = verifyMetaSignature(req.body, sig, META_APP_SECRET);
@@ -1089,7 +1198,7 @@ async function postHandler(req, res) {
       await appendEvent(from, caseId, 'message_in_media', 'media_in', { hasMedia: true });
       await touchCaseMN(from, 'Comprobante/archivo recibido');
 
-      // ✅ Antes confirmabas “a ojo”. Ahora: intentamos validar por external_reference.
+      // ✅ Antes confirmabas “a ojo”. Ahora: intentamos confirmar por external_reference.
       if (sess.state === 'awaiting_payment') {
         const sr = await mpSearchByExternalRef(caseId);
         if (sr.ok) {
@@ -1097,13 +1206,13 @@ async function postHandler(req, res) {
           if (cand) {
             const match = mpPaymentMatches(cand, caseId, DEPOSIT_VALUE);
             if (match.ok) {
-              await confirmPaymentFlow({ waId: from, caseId, paymentId: cand.id, ctx: sess.ctx, label: sess.ctx.label });
+              await confirmPaymentFlow({ waId: from, caseId, paymentId: cand.id, ctx: sess.ctx, label: sess.ctx.label, source: 'media_search' });
               return;
             }
           }
         }
 
-        // si no pudimos confirmar, pasamos a revisión humana
+        // si no pudimos confirmar, revisión humana
         setSession(from, 'handoff', {});
         await upsertCase(from, {
           status: 'payment_review',
@@ -1169,6 +1278,7 @@ app.listen(Number(PORT), '0.0.0.0', () => {
     has_WA_VERIFY_TOKEN: !!WA_VERIFY_TOKEN,
     has_WA_PHONE_NUMBER_ID: !!WA_PHONE_NUMBER_ID,
     has_mp: !!MP_ACCESS_TOKEN,
+    has_mp_notification_url: !!MP_NOTIFICATION_URL,
     deposit_required: DEPOSIT_ON,
     deposit_amount: DEPOSIT_VALUE,
     payment_window_minutes: Math.round(PAYMENT_WINDOW_MS / 60000),
